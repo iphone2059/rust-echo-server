@@ -1,0 +1,22 @@
+[package]
+name = "rust-echo-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Windows x64 RIO echo server (Rust port of the C++ baseline)"
+license = "MIT"
+
+[lib]
+name = "ces"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust-echo-server"
+path = "src/main.rs"
+
+[dependencies]
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "b0f55a720bb4e0942b048db9c9497bafa26526a0", default-features = false, features = ["winsock2", "ws2", "mswsock", "mswsockdef", "ioapiset", "minwinbase", "winbase", "memoryapi", "processthreadsapi", "synchapi", "handleapi", "errhandlingapi", "winnt", "windef", "minwindef", "basetsd", "winerror", "sysinfoapi", "libloaderapi", "wincon", "consoleapi", "securitybaseapi", "synchapi", "profileapi", "realtimeapiset"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
