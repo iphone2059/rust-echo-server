@@ -178,8 +178,9 @@ mod tests {
         assert_eq!(udp_stride(u32::MAX, 144), None);
         // The UDP arena holds depth x (payload + address area) bytes.
         assert_eq!(
-            crate::contract::checked_arena_bytes(256, 65_651, u64::MAX),
+            crate::ces_contract::checked_arena_bytes(256, 65_651, u64::MAX),
             Some(16_806_656)
         );
     }
 }
+

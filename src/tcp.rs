@@ -17,7 +17,7 @@ use windows::Win32::winsock2::INVALID_SOCKET;
 
 use crate::acceptor::{AcceptAction, AcceptState, AcceptTable, AcceptorCore};
 use crate::arena::tcp_stride;
-use crate::contract::{accept_operation_count, tcp_connection_capacity};
+use crate::ces_contract::{accept_operation_count, tcp_connection_capacity};
 use crate::endpoint::{bind_endpoint, listen_endpoint, update_accept_context};
 use crate::native::{
     active_processor_count, configure_socket, fail_fast, load_accept_ex, now_milliseconds, report,
@@ -508,4 +508,5 @@ impl AcceptorRuntime {
         HandoffOutcome::Posted
     }
 }
+
 
