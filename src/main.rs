@@ -31,6 +31,12 @@ fn help() {
     println!("{}", ces::ces_contract::help_text());
 }
 
+/// A malformed command line reports the diagnostic and the usage on stderr, exactly like the
+/// reference: stdout stays empty so a caller can tell a usage error from a successful /h.
+fn help_error() {
+    eprintln!("{}", ces::ces_contract::help_text());
+}
+
 fn run(options: &Options) -> ExitCode {
     match options.protocol {
         Protocol::None => ExitCode::Usage,
@@ -65,7 +71,7 @@ fn main() -> ProcessExitCode {
         Ok(options) => options,
         Err(error) => {
             eprintln!("Invalid arguments: {}", error.0);
-            help();
+            help_error();
             return ProcessExitCode::from(ExitCode::Usage as u8);
         }
     };
