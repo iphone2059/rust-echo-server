@@ -88,7 +88,7 @@ fn switch_offset(token: &str) -> Option<usize> {
 fn numeric(value: &str) -> Result<u64, ArgumentError> {
     value
         .parse::<u64>()
-        .map_err(|_| ArgumentError("numeric switch has an invalid value".to_string()))
+        .map_err(|_| ArgumentError(crate::ces_contract::token::INVALID_NUMBER.to_string()))
 }
 
 /// Strict parser: unknown switches, empty values, positional arguments and
@@ -133,7 +133,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             name.as_str(),
             "p" | "s" | "t" | "w" | "b" | "k" | "threads" | "rio-buffer" | "cq" | "memory"
         ) {
-            return Err(ArgumentError("unknown switch".to_string()));
+            return Err(ArgumentError(crate::ces_contract::token::UNKNOWN_SWITCH.to_string()));
         }
         let value = match inline {
             Some(value) => value,
@@ -169,9 +169,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             _ => 1_048_576..=u64::MAX,
         };
         if !range.contains(&number) {
-            return Err(ArgumentError(
-                "unknown switch or value outside its valid range".to_string(),
-            ));
+            return Err(ArgumentError(crate::ces_contract::token::OUT_OF_RANGE.to_string()));
         }
         match name.as_str() {
             "s" => options.port = number as u16,
@@ -194,17 +192,19 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             _ => options.memory_bytes = number,
         }
     }
+    if options.protocol == Protocol::Tcp && saw_udp_depth {
+        return Err(ArgumentError(crate::ces_contract::token::PROTOCOL_OPTION.to_string()));
+    }
+    if options.protocol == Protocol::Udp && saw_timeout {
+        return Err(ArgumentError(crate::ces_contract::token::PROTOCOL_OPTION.to_string()));
+    }
+    // Option validation precedes the help short-circuit, exactly like the reference: /h never
+    // masks a malformed command line.
     if options.help {
         return Ok(options);
     }
     if options.protocol == Protocol::None {
         return Err(ArgumentError("missing /p tcp or /p udp".to_string()));
-    }
-    if options.protocol == Protocol::Tcp && saw_udp_depth {
-        return Err(ArgumentError("/k is available only for UDP".to_string()));
-    }
-    if options.protocol == Protocol::Udp && saw_timeout {
-        return Err(ArgumentError("/t is available only for TCP".to_string()));
     }
     if options.protocol == Protocol::Udp {
         if !saw_rio_buffer {

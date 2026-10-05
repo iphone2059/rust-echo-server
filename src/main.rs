@@ -28,10 +28,7 @@ unsafe extern "system" fn console_handler(event: u32) -> windows::core::BOOL {
 }
 
 fn help() {
-    println!("Usage: rust-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds]");
-    println!("       [/b bytes] [/k udp-depth] [/threads workers] [/rio-buffer bytes]");
-    println!("       [/cq capacity] [/memory bytes] [/q] [/stats]");
-    println!("Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.");
+    println!("{}", ces::ces_contract::help_text());
 }
 
 fn run(options: &Options) -> ExitCode {
