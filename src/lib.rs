@@ -10,6 +10,7 @@
 
 pub mod acceptor;
 pub mod arena;
+pub mod ces_contract;
 pub mod connection;
 pub mod contract;
 pub mod endpoint;
