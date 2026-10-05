@@ -2,7 +2,7 @@ use std::process::ExitCode as ProcessExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use ces::contract::parse;
+use ces::ces_contract::parse;
 use ces::native::{report, NativeError};
 use ces::server::run_server;
 use ces::types::{ExitCode, Options, Protocol};
@@ -81,3 +81,4 @@ fn main() -> ProcessExitCode {
     }
     ProcessExitCode::from(run(&options) as u8)
 }
+
