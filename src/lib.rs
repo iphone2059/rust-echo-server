@@ -13,7 +13,7 @@ pub mod arena;
 pub mod ces_contract;
 pub mod connection;
 pub mod endpoint;
-pub mod engine;
+pub mod ces_engine;
 pub mod native;
 pub mod rio;
 pub mod server;
