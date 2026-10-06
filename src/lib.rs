@@ -8,18 +8,14 @@
 //! and its policy, `udp` the datagram slots, and `worker`, `tcp` and `udp_runtime` the
 //! native threads that drive them.
 
-pub mod acceptor;
 pub mod arena;
 pub mod ces_contract;
-pub mod connection;
+pub mod ces_engine_internal;
 pub mod endpoint;
 pub mod ces_engine;
 pub mod native;
 pub mod rio;
 pub mod server;
-pub mod tcp;
 pub mod timer;
 pub mod types;
-pub mod udp;
-pub mod udp_runtime;
 pub mod worker;

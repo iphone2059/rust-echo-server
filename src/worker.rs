@@ -16,7 +16,7 @@ use windows::Win32::minwinbase::OVERLAPPED;
 use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
 use windows::Win32::winsock2::INVALID_SOCKET;
 
-use crate::acceptor::AcceptTable;
+use crate::ces_engine_internal::acceptor::AcceptTable;
 use crate::arena::Arena;
 use crate::ces_contract::notification_packet_matches;
 use crate::ces_engine::{Step, TcpEngine};
@@ -500,7 +500,7 @@ impl TcpWorker {
         let Some(operation) = accept.operation(index) else {
             fail_fast("server accept acknowledgement identity", ERROR_INVALID_DATA);
         };
-        let key = operation as *const crate::acceptor::AcceptOperation as usize;
+        let key = operation as *const crate::ces_engine_internal::acceptor::AcceptOperation as usize;
         if let Err(error) = post_completion(accept.port().0, key, ptr::null_mut()) {
             fail_fast("PostQueuedCompletionStatus(accept ack)", error.code);
         }
@@ -512,5 +512,6 @@ impl TcpWorker {
 fn set_ready(handle: SendHandle) -> bool {
     unsafe { windows::Win32::synchapi::SetEvent(handle.0) }.as_bool()
 }
+
 
 
