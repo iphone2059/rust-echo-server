@@ -24,7 +24,7 @@ use crate::types::{
     COMPLETION_DRAIN_BATCHES, ERROR_INVALID_DATA, ERROR_IO_INCOMPLETE, ERROR_NOT_ENOUGH_MEMORY,
     WAIT_TIMEOUT,
 };
-use crate::udp::{UdpAction, UdpEngine};
+use crate::ces_engine_internal::udp::{UdpAction, UdpEngine};
 
 /// The RIO request context for one datagram slot. It is the record's first field, so the
 /// address RIO hands back is the record address.
@@ -407,4 +407,5 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
     drop(runtime);
     if failed { ExitCode::Network } else { ExitCode::Success }
 }
+
 
