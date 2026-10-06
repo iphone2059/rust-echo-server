@@ -1,7 +1,7 @@
 //! Shared server vocabulary: protocol, exit codes, parsed options, worker lifecycle and
 //! the engine statistics the report is derived from.
 //!
-//! Every name mirrors the C++ baseline (ces_types.h / ces_engine_internal.h) and the
+//! Every name mirrors the C++ baseline (ces_types.h / internal.h) and the
 //! Swift port (CESTypes.swift / CESEngineInternal.swift) so the three servers share one
 //! contract.
 
@@ -292,4 +292,5 @@ mod tests {
         assert_eq!(large.bytes, u64::MAX);
     }
 }
+
 

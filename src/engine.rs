@@ -5,7 +5,7 @@
 //! decision is returned as a `Step` that the loop carries out through RIO, which keeps
 //! the whole echo progression testable without a network.
 
-use crate::ces_engine_internal::connection::{Connection, ConnectionStep};
+use crate::internal::connection::{Connection, ConnectionStep};
 use crate::timer::TimerHeap;
 use crate::types::{worker_may_exit, EngineOperation, Statistics, WorkerLifecycle, WorkerPhase};
 
@@ -99,7 +99,7 @@ impl TcpEngine {
     /// Gives a taken slot back without adopting it (the request queue could not be made).
     pub fn return_slot(&mut self, index: u32) {
         if let Some(connection) = self.connections.get_mut(index as usize) {
-            connection.state = crate::ces_engine_internal::connection::ConnectionState::Idle;
+            connection.state = crate::internal::connection::ConnectionState::Idle;
         }
         self.free_indices.push(index);
     }
@@ -269,7 +269,7 @@ impl TcpEngine {
             ConnectionStep::CloseAndRelease => {
                 self.timers.remove(index);
                 if let Some(connection) = self.connections.get_mut(index as usize) {
-                    connection.state = crate::ces_engine_internal::connection::ConnectionState::Idle;
+                    connection.state = crate::internal::connection::ConnectionState::Idle;
                 }
                 self.free_indices.push(index);
                 Some(Step::Release { index })
@@ -286,7 +286,7 @@ impl TcpEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ces_engine_internal::connection::ConnectionState;
+    use crate::internal::connection::ConnectionState;
     use crate::types::Protocol;
 
     fn engine(slots: u32) -> TcpEngine {
@@ -437,5 +437,6 @@ mod tests {
         assert!(final_line.ends_with(" active=1"));
     }
 }
+
 
 

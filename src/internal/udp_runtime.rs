@@ -13,7 +13,7 @@ use windows::Win32::minwinbase::OVERLAPPED;
 use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
 
 use crate::arena::{udp_stride, Arena};
-use crate::ces_contract::checked_arena_bytes;
+use crate::contract::checked_arena_bytes;
 use crate::native::{fail_fast, now_milliseconds, report, RioFunctions, SocketOwner};
 use crate::rio::{
     empty_result, get_queued_completion_status, post_completion, CompletionPort, CompletionQueue,
@@ -24,7 +24,7 @@ use crate::types::{
     COMPLETION_DRAIN_BATCHES, ERROR_INVALID_DATA, ERROR_IO_INCOMPLETE, ERROR_NOT_ENOUGH_MEMORY,
     WAIT_TIMEOUT,
 };
-use crate::ces_engine_internal::udp::{UdpAction, UdpEngine};
+use crate::internal::udp::{UdpAction, UdpEngine};
 
 /// The RIO request context for one datagram slot. It is the record's first field, so the
 /// address RIO hands back is the record address.
@@ -104,7 +104,7 @@ impl UdpRuntime {
         if let Err(error) = self.queue.arm(&rio) {
             fail_fast("RIONotify(UDP)", error.code);
         }
-        if !crate::ces_contract::notification_mark_rearmed(armed) {
+        if !crate::contract::notification_mark_rearmed(armed) {
             fail_fast("server UDP notification rearm transition", ERROR_INVALID_DATA);
         }
     }
@@ -312,7 +312,7 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
             if !packet.succeeded {
                 fail_fast("GetQueuedCompletionStatus(UDP notification)", packet.error as i32);
             }
-            if !crate::ces_contract::notification_packet_matches(
+            if !crate::contract::notification_packet_matches(
                 packet.key,
                 packet.overlapped as usize,
                 runtime.key_address(),
@@ -320,7 +320,7 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
             ) {
                 fail_fast("server UDP RIO notification key", ERROR_INVALID_DATA);
             }
-            if !crate::ces_contract::notification_mark_delivered(&mut armed) {
+            if !crate::contract::notification_mark_delivered(&mut armed) {
                 fail_fast("server UDP notification delivery transition", ERROR_INVALID_DATA);
             }
             runtime.queue.on_delivery();
@@ -374,7 +374,7 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
         if !packet.succeeded {
             fail_fast("GetQueuedCompletionStatus(UDP notification shutdown)", packet.error as i32);
         }
-        if !crate::ces_contract::notification_packet_matches(
+        if !crate::contract::notification_packet_matches(
             packet.key,
             packet.overlapped as usize,
             0,
@@ -382,7 +382,7 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
         ) {
             fail_fast("UDP notification shutdown packet", ERROR_INVALID_DATA);
         }
-        if !crate::ces_contract::notification_mark_delivered(&mut armed) {
+        if !crate::contract::notification_mark_delivered(&mut armed) {
             fail_fast("UDP notification shutdown transition", ERROR_INVALID_DATA);
         }
     }
@@ -407,5 +407,6 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
     drop(runtime);
     if failed { ExitCode::Network } else { ExitCode::Success }
 }
+
 
 

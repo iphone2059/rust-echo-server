@@ -7,9 +7,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::native::{registered_socket, report, RioFunctions, Winsock};
-use crate::ces_engine_internal::tcp::run_tcp;
+use crate::internal::tcp::run_tcp;
 use crate::types::{ExitCode, Options, Protocol};
-use crate::ces_engine_internal::udp_runtime::run_udp;
+use crate::internal::udp_runtime::run_udp;
 
 /// Runs one parsed command line. `stop_requested` is the console handler's flag: the
 /// engine observes it between drain batches, not only between iterations.
@@ -46,4 +46,5 @@ pub fn run_server(options: &Options, stop_requested: &Arc<AtomicBool>) -> ExitCo
     drop(winsock);
     result
 }
+
 

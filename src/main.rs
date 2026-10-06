@@ -2,7 +2,7 @@ use std::process::ExitCode as ProcessExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use ces::ces_contract::parse;
+use ces::contract::parse;
 use ces::native::{report, NativeError};
 use ces::server::run_server;
 use ces::types::{ExitCode, Options, Protocol};
@@ -28,13 +28,13 @@ unsafe extern "system" fn console_handler(event: u32) -> windows::core::BOOL {
 }
 
 fn help() {
-    println!("{}", ces::ces_contract::help_text());
+    println!("{}", ces::contract::help_text());
 }
 
 /// A malformed command line reports the diagnostic and the usage on stderr, exactly like the
 /// reference: stdout stays empty so a caller can tell a usage error from a successful /h.
 fn help_error() {
-    eprintln!("{}", ces::ces_contract::help_text());
+    eprintln!("{}", ces::contract::help_text());
 }
 
 fn run(options: &Options) -> ExitCode {
@@ -81,4 +81,5 @@ fn main() -> ProcessExitCode {
     }
     ProcessExitCode::from(run(&options) as u8)
 }
+
 

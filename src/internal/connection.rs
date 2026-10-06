@@ -5,7 +5,7 @@
 //! calls. It is the direct counterpart of the connection record handled by
 //! `ces_engine_process_result` in the C++ baseline and `processResult` in the Swift port.
 
-use crate::ces_contract::advance_offset_u32;
+use crate::contract::advance_offset_u32;
 use crate::types::{EngineOperation, ERROR_SUCCESS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,4 +268,5 @@ mod tests {
         assert_eq!(connection.close(), ConnectionStep::None);
     }
 }
+
 

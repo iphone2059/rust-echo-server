@@ -16,10 +16,10 @@ use windows::Win32::minwinbase::OVERLAPPED;
 use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
 use windows::Win32::winsock2::INVALID_SOCKET;
 
-use crate::ces_engine_internal::acceptor::AcceptTable;
+use crate::internal::acceptor::AcceptTable;
 use crate::arena::Arena;
-use crate::ces_contract::notification_packet_matches;
-use crate::ces_engine::{Step, TcpEngine};
+use crate::contract::notification_packet_matches;
+use crate::engine::{Step, TcpEngine};
 use crate::native::{
     fail_fast, now_milliseconds, report, NativeError, RioFunctions, SendHandle, SocketOwner,
 };
@@ -122,7 +122,7 @@ impl TcpWorker {
         if stride == 0 || slot_count == 0 {
             return Err(NativeError { stage: "worker registered arena size", code: 8 });
         }
-        let arena_bytes = crate::ces_contract::checked_arena_bytes(
+        let arena_bytes = crate::contract::checked_arena_bytes(
             u64::from(slot_count),
             u64::from(stride),
             memory_share,
@@ -220,7 +220,7 @@ impl TcpWorker {
                 ) {
                     fail_fast("server worker RIO notification key", ERROR_INVALID_DATA);
                 }
-                if !crate::ces_contract::notification_mark_delivered(&mut self.engine.notification_armed) {
+                if !crate::contract::notification_mark_delivered(&mut self.engine.notification_armed) {
                     fail_fast("server worker notification delivery transition", 5023);
                 }
                 self.queue.on_delivery();
@@ -289,7 +289,7 @@ impl TcpWorker {
         if let Err(error) = self.queue.arm(&rio) {
             fail_fast("RIONotify(worker)", error.code);
         }
-        if !crate::ces_contract::notification_mark_rearmed(&mut self.engine.notification_armed) {
+        if !crate::contract::notification_mark_rearmed(&mut self.engine.notification_armed) {
             fail_fast("server worker notification rearm transition", 5023);
         }
     }
@@ -500,7 +500,7 @@ impl TcpWorker {
         let Some(operation) = accept.operation(index) else {
             fail_fast("server accept acknowledgement identity", ERROR_INVALID_DATA);
         };
-        let key = operation as *const crate::ces_engine_internal::acceptor::AcceptOperation as usize;
+        let key = operation as *const crate::internal::acceptor::AcceptOperation as usize;
         if let Err(error) = post_completion(accept.port().0, key, ptr::null_mut()) {
             fail_fast("PostQueuedCompletionStatus(accept ack)", error.code);
         }
@@ -512,6 +512,7 @@ impl TcpWorker {
 fn set_ready(handle: SendHandle) -> bool {
     unsafe { windows::Win32::synchapi::SetEvent(handle.0) }.as_bool()
 }
+
 
 
 
