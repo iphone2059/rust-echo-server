@@ -117,7 +117,7 @@ fn switch_offset(token: &str) -> Option<usize> {
 fn numeric(value: &str) -> Result<u64, ArgumentError> {
     value
         .parse::<u64>()
-        .map_err(|_| ArgumentError(crate::ces_contract::token::INVALID_NUMBER.to_string()))
+        .map_err(|_| ArgumentError(crate::contract::token::INVALID_NUMBER.to_string()))
 }
 
 /// Strict parser: unknown switches, empty values, positional arguments and
@@ -162,7 +162,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             name.as_str(),
             "p" | "s" | "t" | "w" | "b" | "k" | "threads" | "rio-buffer" | "cq" | "memory"
         ) {
-            return Err(ArgumentError(crate::ces_contract::token::UNKNOWN_SWITCH.to_string()));
+            return Err(ArgumentError(crate::contract::token::UNKNOWN_SWITCH.to_string()));
         }
         let value = match inline {
             Some(value) => value,
@@ -198,7 +198,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             _ => 1_048_576..=u64::MAX,
         };
         if !range.contains(&number) {
-            return Err(ArgumentError(crate::ces_contract::token::OUT_OF_RANGE.to_string()));
+            return Err(ArgumentError(crate::contract::token::OUT_OF_RANGE.to_string()));
         }
         match name.as_str() {
             "s" => options.port = number as u16,
@@ -222,10 +222,10 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         }
     }
     if options.protocol == Protocol::Tcp && saw_udp_depth {
-        return Err(ArgumentError(crate::ces_contract::token::PROTOCOL_OPTION.to_string()));
+        return Err(ArgumentError(crate::contract::token::PROTOCOL_OPTION.to_string()));
     }
     if options.protocol == Protocol::Udp && saw_timeout {
-        return Err(ArgumentError(crate::ces_contract::token::PROTOCOL_OPTION.to_string()));
+        return Err(ArgumentError(crate::contract::token::PROTOCOL_OPTION.to_string()));
     }
     // Option validation precedes the help short-circuit, exactly like the reference: /h never
     // masks a malformed command line.
@@ -333,3 +333,4 @@ mod tests {
         assert_eq!(accept_operation_count(0, 32, 1_024), 0);
     }
 }
+

@@ -9,10 +9,10 @@
 //! native threads that drive them.
 
 pub mod arena;
-pub mod ces_contract;
-pub mod ces_engine_internal;
+pub mod contract;
+pub mod internal;
 pub mod endpoint;
-pub mod ces_engine;
+pub mod engine;
 pub mod native;
 pub mod rio;
 pub mod server;
