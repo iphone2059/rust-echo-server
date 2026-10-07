@@ -12,10 +12,10 @@ use std::sync::Arc;
 use windows::Win32::minwinbase::OVERLAPPED;
 use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
 
-use crate::arena::{udp_stride, Arena};
+use crate::native::arena::{udp_stride, Arena};
 use crate::contract::checked_arena_bytes;
 use crate::native::{fail_fast, now_milliseconds, report, RioFunctions, SocketOwner};
-use crate::rio::{
+use crate::native::rio::{
     empty_result, get_queued_completion_status, post_completion, CompletionPort, CompletionQueue,
     RequestQueue,
 };
@@ -24,7 +24,7 @@ use crate::types::{
     COMPLETION_DRAIN_BATCHES, ERROR_INVALID_DATA, ERROR_IO_INCOMPLETE, ERROR_NOT_ENOUGH_MEMORY,
     WAIT_TIMEOUT,
 };
-use crate::internal::udp::{UdpAction, UdpEngine};
+use crate::udp::{UdpAction, UdpEngine};
 
 /// The RIO request context for one datagram slot. It is the record's first field, so the
 /// address RIO hands back is the record address.
@@ -175,7 +175,7 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
         report(error.stage, error.code);
         return ExitCode::Network;
     }
-    if let Err(error) = crate::endpoint::bind_endpoint(socket.raw(), options.port) {
+    if let Err(error) = crate::native::endpoint::bind_endpoint(socket.raw(), options.port) {
         report(error.stage, error.code);
         return ExitCode::Network;
     }
@@ -407,6 +407,7 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
     drop(runtime);
     if failed { ExitCode::Network } else { ExitCode::Success }
 }
+
 
 
 
