@@ -135,7 +135,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         let token = arguments[index].clone();
         index += 1;
         let Some(offset) = switch_offset(&token) else {
-            return Err(ArgumentError("server does not accept positional arguments".to_string()));
+            return Err(ArgumentError("unexpected-target".to_string()));
         };
         let rest = &token[offset..];
         let (name, inline) = match rest.split_once('=') {
@@ -233,7 +233,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         return Ok(options);
     }
     if options.protocol == Protocol::None {
-        return Err(ArgumentError("missing /p tcp or /p udp".to_string()));
+        return Err(ArgumentError("missing-protocol".to_string()));
     }
     if options.protocol == Protocol::Udp {
         if !saw_rio_buffer {
@@ -333,4 +333,3 @@ mod tests {
         assert_eq!(accept_operation_count(0, 32, 1_024), 0);
     }
 }
-
