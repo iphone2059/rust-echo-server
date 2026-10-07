@@ -15,15 +15,15 @@ use std::time::Duration;
 use windows::Win32::mswsock::LPFN_ACCEPTEX;
 use windows::Win32::winsock2::INVALID_SOCKET;
 
-use crate::internal::acceptor::{AcceptAction, AcceptState, AcceptTable, AcceptorCore};
-use crate::arena::tcp_stride;
+use crate::acceptor::{AcceptAction, AcceptState, AcceptTable, AcceptorCore};
+use crate::native::arena::tcp_stride;
 use crate::contract::{accept_operation_count, tcp_connection_capacity};
-use crate::endpoint::{bind_endpoint, listen_endpoint, update_accept_context};
+use crate::native::endpoint::{bind_endpoint, listen_endpoint, update_accept_context};
 use crate::native::{
     active_processor_count, configure_socket, fail_fast, load_accept_ex, now_milliseconds, report,
     registered_socket, HandleOwner, RioFunctions, SendHandle, SocketOwner,
 };
-use crate::rio::{get_queued_completion_status, post_completion, CompletionPort};
+use crate::native::rio::{get_queued_completion_status, post_completion, CompletionPort};
 use crate::types::{
     resolved_worker_count, ExitCode, Options, Protocol, Statistics, ACCEPTS_PER_WORKER,
     ACCEPT_ADDRESS_BYTES, ADMISSION_CLOSED_KEY, ERROR_INVALID_DATA, ERROR_IO_PENDING,
@@ -494,7 +494,7 @@ impl AcceptorRuntime {
         let Some(key) = self
             .table
             .operation(index)
-            .map(|operation| operation as *const crate::internal::acceptor::AcceptOperation as usize)
+            .map(|operation| operation as *const crate::acceptor::AcceptOperation as usize)
         else {
             report("server accept handoff identity", ERROR_INVALID_DATA);
             self.close_accept_socket(index);
@@ -508,6 +508,7 @@ impl AcceptorRuntime {
         HandoffOutcome::Posted
     }
 }
+
 
 
 

@@ -11,7 +11,7 @@ use windows::Win32::memoryapi::{VirtualAlloc, VirtualFree};
 use windows::Win32::mswsockdef::RIO_BUF;
 
 use crate::native::{NativeError, RioFunctions};
-use crate::rio::RegisteredBuffer;
+use crate::native::rio::RegisteredBuffer;
 
 // VirtualAlloc/VirtualFree flag values from winnt.h. The generated tree does not expose
 // them under memoryapi, and the API takes plain u32 flags.
@@ -183,5 +183,6 @@ mod tests {
         );
     }
 }
+
 
 

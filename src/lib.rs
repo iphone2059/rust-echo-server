@@ -8,14 +8,12 @@
 //! and its policy, `udp` the datagram slots, and `worker`, `tcp` and `udp_runtime` the
 //! native threads that drive them.
 
-pub mod arena;
 pub mod contract;
-pub mod internal;
-pub mod endpoint;
 pub mod engine;
 pub mod native;
-pub mod rio;
 pub mod server;
-pub mod timer;
 pub mod types;
 pub mod worker;
+pub mod acceptor;
+pub mod connection;
+pub mod udp;

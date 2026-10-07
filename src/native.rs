@@ -333,3 +333,8 @@ pub fn load_accept_ex(listener: SOCKET) -> Result<LPFN_ACCEPTEX, NativeError> {
     Ok(function)
 }
 
+// The Windows substrate: the RIO wrappers, the registered arena and the endpoint helpers.
+pub mod arena;
+pub mod endpoint;
+pub mod rio;
+
