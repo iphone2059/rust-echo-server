@@ -301,9 +301,11 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
         }
         let expired = now_milliseconds() >= run_deadline;
         let stop_now = stop.load(Ordering::Acquire);
-        if !runtime.engine.closing && (stop_now || expired) {
-            // Closing the socket first is what cancels the posted requests; the drain below
-            // then completes them all before any storage is released.
+        // Closing the socket is what cancels the posted requests, so it has to follow from closing
+        // alone and not only from the stop request: an error path sets closing without closing the
+        // socket, and a drain waiting for completions that can never arrive never ends. Both calls
+        // are idempotent, so running them while closing is safe.
+        if runtime.engine.closing || stop_now || expired {
             runtime.engine.begin_drain();
             runtime.socket.reset();
         }
@@ -330,8 +332,9 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
                 // bounded drain also observes the stop request and the run deadline: the
                 // socket is closed here and no further request is reposted, which is what
                 // keeps a controlled stop bounded under full load.
-                if !runtime.engine.closing
-                    && (stop.load(Ordering::Acquire) || now_milliseconds() >= run_deadline)
+                if runtime.engine.closing
+                    || stop.load(Ordering::Acquire)
+                    || now_milliseconds() >= run_deadline
                 {
                     runtime.engine.begin_drain();
                     runtime.socket.reset();
@@ -351,7 +354,13 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
                         .on_completion(index, result.Status, result.BytesTransferred)
                     {
                         UdpAction::Post { index } => runtime.post_slot(index),
-                        UdpAction::Fatal { error, .. } => report("UDP RIO completion", error),
+                        UdpAction::Fatal { error, .. } => {
+                    // The engine gave up on the socket, so cancel the posted requests here as well
+                    // instead of leaving the drain to wait for completions the socket still holds.
+                    report("UDP RIO completion", error);
+                    runtime.engine.begin_drain();
+                    runtime.socket.reset();
+                }
                         UdpAction::None => {}
                     }
                 }
@@ -407,7 +416,6 @@ pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> 
     drop(runtime);
     if failed { ExitCode::Network } else { ExitCode::Success }
 }
-
 
 
 
