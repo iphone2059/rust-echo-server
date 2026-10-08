@@ -43,7 +43,7 @@ function Invoke-Server {
     $out = [System.IO.Path]::GetTempFileName()
     $err = [System.IO.Path]::GetTempFileName()
     try {
-        $process = Start-Process -FilePath $ServerPath -ArgumentList $Arguments -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -WindowStyle Hidden
+        $process = Start-Process -FilePath $ServerPath -ArgumentList $Arguments -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow
         $process.WaitForExit(20000) | Out-Null
         if (-not $process.HasExited) { $process.Kill($true); throw "server did not exit: $($Arguments -join ' ')" }
         [pscustomobject]@{
@@ -84,7 +84,7 @@ Write-Host 'PASS server command-line contract'
 $tcpPort = Get-FreeTcpPort
 $tcpOutput = [System.IO.Path]::GetTempFileName()
 $tcpArguments = @('/p', 'tcp', '/s', $tcpPort, '/w', '2', '/q', '/threads', '2', '/cq', '1024', '/memory', '67108864', '/stats')
-$tcp = Start-Process -FilePath $ServerPath -ArgumentList $tcpArguments -RedirectStandardOutput $tcpOutput -PassThru -WindowStyle Hidden
+$tcp = Start-Process -FilePath $ServerPath -ArgumentList $tcpArguments -RedirectStandardOutput $tcpOutput -PassThru -NoNewWindow
 try {
     Wait-TcpReady -Port $tcpPort -Process $tcp
     $client = [System.Net.Sockets.TcpClient]::new()
@@ -121,7 +121,7 @@ Write-Host 'PASS server TCP echo, statistics and clean stop'
 # --- TCP idle timeout -------------------------------------------------------------------
 $timeoutPort = Get-FreeTcpPort
 $timeoutArguments = @('/p', 'tcp', '/s', $timeoutPort, '/t', '1', '/w', '3', '/q', '/threads', '1', '/cq', '128', '/memory', '16777216')
-$timeoutServer = Start-Process -FilePath $ServerPath -ArgumentList $timeoutArguments -PassThru -WindowStyle Hidden
+$timeoutServer = Start-Process -FilePath $ServerPath -ArgumentList $timeoutArguments -PassThru -NoNewWindow
 try {
     Wait-TcpReady -Port $timeoutPort -Process $timeoutServer
     $socket = [System.Net.Sockets.Socket]::new([System.Net.Sockets.AddressFamily]::InterNetwork,
@@ -155,7 +155,7 @@ Write-Host 'PASS server TCP idle timeout closes the connection'
 # --- TCP connect storm under load -------------------------------------------------------
 $stormPort = Get-FreeTcpPort
 $stormArguments = @('/p', 'tcp', '/s', $stormPort, '/w', '2', '/q', '/threads', '4', '/cq', '2048', '/memory', '134217728')
-$stormServer = Start-Process -FilePath $ServerPath -ArgumentList $stormArguments -PassThru -WindowStyle Hidden
+$stormServer = Start-Process -FilePath $ServerPath -ArgumentList $stormArguments -PassThru -NoNewWindow
 $stormJobs = @()
 try {
     Wait-TcpReady -Port $stormPort -Process $stormServer
@@ -194,7 +194,7 @@ Write-Host 'PASS server TCP connect storm stops cleanly'
 $udpPort = Get-FreeUdpPort
 $udpOutput = [System.IO.Path]::GetTempFileName()
 $udpArguments = @('/p', 'udp', '/s', $udpPort, '/w', '2', '/q', '/k', '64', '/cq', '1024', '/memory', '67108864', '/stats')
-$udp = Start-Process -FilePath $ServerPath -ArgumentList $udpArguments -RedirectStandardOutput $udpOutput -PassThru -WindowStyle Hidden
+$udp = Start-Process -FilePath $ServerPath -ArgumentList $udpArguments -RedirectStandardOutput $udpOutput -PassThru -NoNewWindow
 try {
     Start-Sleep -Milliseconds 250
     if ($udp.HasExited) { throw "UDP server exited early with code $($udp.ExitCode)" }
@@ -231,7 +231,7 @@ Write-Host 'PASS server UDP echo of 0, 1 and 65507 byte datagrams'
 # --- UDP traffic drain ------------------------------------------------------------------
 $udpTrafficPort = Get-FreeUdpPort
 $udpTrafficArguments = @('/p', 'udp', '/s', $udpTrafficPort, '/w', '2', '/q', '/k', '64', '/cq', '1024', '/memory', '67108864')
-$udpTraffic = Start-Process -FilePath $ServerPath -ArgumentList $udpTrafficArguments -PassThru -WindowStyle Hidden
+$udpTraffic = Start-Process -FilePath $ServerPath -ArgumentList $udpTrafficArguments -PassThru -NoNewWindow
 $udpTrafficJob = $null
 try {
     Start-Sleep -Milliseconds 250
@@ -279,7 +279,7 @@ Write-Host 'PASS server stays silent outside /stats'
 $conflictPort = Get-FreeTcpPort
 $conflictOutput = [System.IO.Path]::GetTempFileName()
 $conflictArguments = @('/p', 'tcp', '/s', $conflictPort, '/w', '6', '/q', '/threads', '2', '/cq', '1024', '/memory', '67108864', '/stats')
-$first = Start-Process -FilePath $ServerPath -ArgumentList $conflictArguments -RedirectStandardOutput $conflictOutput -PassThru -WindowStyle Hidden
+$first = Start-Process -FilePath $ServerPath -ArgumentList $conflictArguments -RedirectStandardOutput $conflictOutput -PassThru -NoNewWindow
 try {
     Wait-TcpReady -Port $conflictPort -Process $first
     $second = Invoke-Server @('/p', 'tcp', '/s', $conflictPort, '/w', '2', '/q')

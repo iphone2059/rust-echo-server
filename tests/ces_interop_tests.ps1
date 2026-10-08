@@ -38,7 +38,7 @@ function Invoke-Scenario {
     $output = [System.IO.Path]::GetTempFileName()
     $errorFile = [System.IO.Path]::GetTempFileName()
     $arguments = @('/p', $Protocol, '/s', $Port) + $ServerArguments
-    $server = Start-Process -FilePath $ServerPath -ArgumentList $arguments -RedirectStandardOutput $output -RedirectStandardError $errorFile -PassThru -WindowStyle Hidden
+    $server = Start-Process -FilePath $ServerPath -ArgumentList $arguments -RedirectStandardOutput $output -RedirectStandardError $errorFile -PassThru -NoNewWindow
     try {
         Start-Sleep -Milliseconds 400
         if ($server.HasExited) { throw "$Label server exited early with code $($server.ExitCode)" }
