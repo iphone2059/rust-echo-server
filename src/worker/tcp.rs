@@ -147,12 +147,17 @@ impl AcceptorRuntime {
     /// slot while the operation is posted, or the table mirror once it was transferred for
     /// a handoff.
     fn close_accept_socket(&mut self, index: u32) {
-        self.operation_sockets[index as usize].reset();
-        if let Some(raw) = self.table.clear_socket(index) {
-            if raw != INVALID_SOCKET {
-                let mut owner = SocketOwner::new(raw);
-                owner.reset();
-            }
+        // The socket is owned by exactly one of the two places: the acceptor's own slot while the
+        // operation is posted, or the table mirror once it was transferred for a handoff. Closing both
+        // closed one value twice, and Windows is free to hand a closed value to another socket in
+        // between. The slot therefore hands its value over with release(), which does not close it, and
+        // the single owner is closed once below.
+        let slot_raw = self.operation_sockets[index as usize].raw();
+        let _ = self.operation_sockets[index as usize].release();
+        let raw = self.table.clear_socket(index).unwrap_or(slot_raw);
+        if raw != INVALID_SOCKET {
+            let mut owner = SocketOwner::new(raw);
+            owner.reset();
         }
     }
 
@@ -508,7 +513,6 @@ impl AcceptorRuntime {
         HandoffOutcome::Posted
     }
 }
-
 
 
 

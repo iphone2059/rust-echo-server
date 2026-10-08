@@ -10,7 +10,7 @@ use core::ffi::c_void;
 use windows::Win32::memoryapi::{VirtualAlloc, VirtualFree};
 use windows::Win32::mswsockdef::RIO_BUF;
 
-use crate::native::{NativeError, RioFunctions};
+use crate::native::{report, NativeError, RioFunctions};
 use crate::native::rio::RegisteredBuffer;
 
 // VirtualAlloc/VirtualFree flag values from winnt.h. The generated tree does not expose
@@ -71,8 +71,11 @@ impl Arena {
         let registered = match RegisteredBuffer::register(rio, slice) {
             Ok(buffer) => buffer,
             Err(error) => {
-                // The pages must not leak when registration is refused.
-                debug_assert!(release_pages(base), "VirtualFree(arena) failed while aborting");
+                // The pages must not leak when registration is refused, and the release has to run in
+                // every build: debug_assert! does not evaluate its argument in a release build.
+                if !release_pages(base) {
+                    report("VirtualFree(arena)", 13);
+                }
                 return Err(error);
             }
         };
@@ -142,7 +145,11 @@ impl Arena {
 
     fn release_pages(&mut self) {
         if !self.base.is_null() {
-            debug_assert!(release_pages(self.base), "VirtualFree(arena) failed during teardown");
+            // Free first, then forget the address, in every build. A debug_assert! skipped the free in
+            // a release build and then cleared the pointer, so the whole region leaked silently.
+            if !release_pages(self.base) {
+                report("VirtualFree(arena)", 13);
+            }
             self.base = core::ptr::null_mut();
             self.bytes = 0;
         }
@@ -183,6 +190,5 @@ mod tests {
         );
     }
 }
-
 
 
