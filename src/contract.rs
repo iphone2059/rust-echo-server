@@ -13,6 +13,10 @@ pub mod token {
     pub const INVALID_NUMBER: &str = "invalid-number";
     pub const OUT_OF_RANGE: &str = "out-of-range";
     pub const UNKNOWN_SWITCH: &str = "unknown-switch";
+    pub const UNEXPECTED_VALUE: &str = "unexpected-value";
+    pub const MISSING_VALUE: &str = "missing-value";
+    pub const MISSING_PROTOCOL: &str = "missing-protocol";
+    pub const UNEXPECTED_TARGET: &str = "unexpected-target";
 }
 
 /// Usage text, one entry per line; printed on stdout for a valid /h command line.
@@ -135,21 +139,17 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
         let token = arguments[index].clone();
         index += 1;
         let Some(offset) = switch_offset(&token) else {
-            return Err(ArgumentError("unexpected-target".to_string()));
+            return Err(ArgumentError(token::UNEXPECTED_TARGET.to_string()));
         };
         let rest = &token[offset..];
         let (name, inline) = match rest.split_once('=') {
-            Some((name, value)) => {
-                if value.is_empty() {
-                    return Err(ArgumentError("switch requires a non-empty inline value".to_string()));
-                }
-                (name.to_ascii_lowercase(), Some(value.to_string()))
-            }
+            Some((name, value)) => (name.to_ascii_lowercase(), Some(value.to_string())),
             None => (rest.to_ascii_lowercase(), None),
         };
         if matches!(name.as_str(), "q" | "quiet" | "stats" | "h" | "help") {
             if inline.is_some() {
-                return Err(ArgumentError("flag switch does not accept a value".to_string()));
+                // A flag never takes a value, and an empty one is still a value.
+                return Err(ArgumentError(token::UNEXPECTED_VALUE.to_string()));
             }
             match name.as_str() {
                 "q" | "quiet" => options.quiet = true,
@@ -165,13 +165,14 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             return Err(ArgumentError(crate::contract::token::UNKNOWN_SWITCH.to_string()));
         }
         let value = match inline {
-            Some(value) => value,
+            Some(value) if !value.is_empty() => value,
+            Some(_) => return Err(ArgumentError(token::MISSING_VALUE.to_string())),
             None => {
                 if index >= arguments.len()
                     || arguments[index].is_empty()
                     || switch_offset(&arguments[index]).is_some()
                 {
-                    return Err(ArgumentError("switch requires a non-empty value".to_string()));
+                    return Err(ArgumentError(token::MISSING_VALUE.to_string()));
                 }
                 let value = arguments[index].clone();
                 index += 1;
@@ -179,10 +180,12 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
             }
         };
         if name == "p" {
+            // The reference matches the protocol keyword itself and reports the parse failure as
+            // an out-of-range value, not as a protocol-specific message.
             options.protocol = match value.to_ascii_lowercase().as_str() {
                 "tcp" => Protocol::Tcp,
                 "udp" => Protocol::Udp,
-                _ => return Err(ArgumentError("/p requires tcp or udp".to_string())),
+                _ => return Err(ArgumentError(token::OUT_OF_RANGE.to_string())),
             };
             continue;
         }
