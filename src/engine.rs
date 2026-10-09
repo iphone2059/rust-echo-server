@@ -88,6 +88,12 @@ impl TcpEngine {
         self.free_indices.pop()
     }
 
+    /// True while the worker is draining. A socket withdrawn then is a shutdown, not a capacity
+    /// refusal, which is the distinction the reference makes when it counts rejected handoffs.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping
+    }
+
     /// Takes the next free slot and adopts it in one step. The worker takes and adopts
     /// separately because the request queue has to exist between the two, but tests and
     /// simple callers use the combined form.
@@ -166,6 +172,9 @@ impl TcpEngine {
     /// connection can only be closed; this is the baseline's "failed post is a session
     /// failure, not a process failure" rule.
     pub fn on_post_failure(&mut self, index: u32) -> Option<Step> {
+        // A post the queue refused is a connection failure, exactly as the reference counts it on
+        // this path: the session ends, but the server itself stays healthy.
+        self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
         let step = {
             let connection = self.connections.get_mut(index as usize)?;
             // The step that asked for this post already counted the operation, but RIO

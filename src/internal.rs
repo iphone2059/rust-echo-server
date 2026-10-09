@@ -1837,7 +1837,12 @@ pub mod worker {
             let mut socket = SocketOwner::new(raw);
             let Some(slot) = self.engine.take_slot() else {
                 // Stopping, or the table is full: closing the socket is the baseline's refused
-                // handoff, and the acceptor reposts the operation.
+                // handoff, and the acceptor reposts the operation. Only a full table is a capacity
+                // refusal, so only that one is counted.
+                if !self.engine.is_stopping() {
+                    self.engine.statistics.rejected =
+                        self.engine.statistics.rejected.wrapping_add(1);
+                }
                 self.ack(accept, index);
                 return;
             };
@@ -1869,6 +1874,10 @@ pub mod worker {
                     core::mem::swap(&mut runtime.socket, &mut socket);
                 }
                 Err(error) => {
+                    // The socket was accepted but its request queue or arena was refused: a
+                    // connection failure on this server, counted as the reference counts it.
+                    self.engine.statistics.network_errors =
+                        self.engine.statistics.network_errors.wrapping_add(1);
                     report(error.stage, error.code);
                     self.engine.return_slot(slot);
                     self.ack(accept, index);
