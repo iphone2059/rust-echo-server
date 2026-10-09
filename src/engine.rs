@@ -139,13 +139,19 @@ impl TcpEngine {
         }
         self.statistics.completions = self.statistics.completions.wrapping_add(1);
         if status == crate::types::ERROR_SUCCESS {
+            // The reference counts every transferred byte on the socket direction that produced
+            // it, separately from `bytes`, which counts only echoes that were verified.
+            let transferred = u64::from(bytes);
             match operation {
                 EngineOperation::Receive => {
                     self.statistics.receives = self.statistics.receives.wrapping_add(1);
+                    self.statistics.received_bytes =
+                        self.statistics.received_bytes.wrapping_add(transferred);
                 }
                 EngineOperation::Send => {
                     self.statistics.sends = self.statistics.sends.wrapping_add(1);
-                    self.statistics.bytes = self.statistics.bytes.wrapping_add(u64::from(bytes));
+                    self.statistics.sent_bytes = self.statistics.sent_bytes.wrapping_add(transferred);
+                    self.statistics.bytes = self.statistics.bytes.wrapping_add(transferred);
                 }
             }
         }
@@ -436,7 +442,11 @@ mod tests {
         assert!(final_line.starts_with(
             "final protocol=tcp elapsed_ms=1000 workers=1 accepted=1 active=0 outstanding=1 "
         ));
-        assert!(final_line.contains(" received_bytes=0 sent_bytes=0 bytes=8 network_errors=0 rejected=0 MiB_per_sec="));
+        // One 8-byte receive and one 8-byte send: the direction counters and the verified total
+        // all advance by the transfer the test posted.
+        assert!(final_line.contains(
+            " received_bytes=8 sent_bytes=8 bytes=8 network_errors=0 rejected=0 MiB_per_sec="
+        ));
     }
 }
 
