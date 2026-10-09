@@ -160,6 +160,11 @@ impl TcpEngine {
                     self.statistics.bytes = self.statistics.bytes.wrapping_add(transferred);
                 }
             }
+        } else {
+            // A failed completion is a connection failure. Counting it here is what makes a peer
+            // that resets report one error per established connection, exactly as the reference
+            // does: that many receives were outstanding when the connection went away.
+            self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
         }
         let step = {
             let connection = self.connections.get_mut(index as usize)?;
