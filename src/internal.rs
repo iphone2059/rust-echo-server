@@ -1367,7 +1367,10 @@ pub mod runtime {
         let statistics = runtime.engine.statistics;
         let failed = runtime.engine.failed;
         if options.stats {
-            println!("{}", statistics.final_line(Protocol::Udp, elapsed, runtime.engine.outstanding));
+            println!(
+                "{}",
+                statistics.final_line(Protocol::Udp, elapsed, 1, runtime.engine.outstanding)
+            );
         }
         // Release order of the baseline: completion queue, registration and arena, then the
         // socket, then the port. Nothing is outstanding, so no completion can be lost.
@@ -2284,7 +2287,12 @@ pub mod tcp {
         if options.stats {
             println!(
                 "{}",
-                statistics.final_line(Protocol::Tcp, now_milliseconds().saturating_sub(start), 0)
+                statistics.final_line(
+                    Protocol::Tcp,
+                    now_milliseconds().saturating_sub(start),
+                    worker_count,
+                    0
+                )
             );
         }
         if failure.load(Ordering::Acquire) { ExitCode::Network } else { ExitCode::Success }

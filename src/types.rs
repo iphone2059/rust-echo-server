@@ -179,7 +179,16 @@ pub struct Statistics {
     pub completions: u64,
     pub receives: u64,
     pub sends: u64,
+    /// Every byte the socket delivered, which is not the same total as `bytes`: `bytes` counts
+    /// only echoes that were verified against the payload.
+    pub received_bytes: u64,
+    /// Every byte handed to the socket, whether or not its echo came back.
+    pub sent_bytes: u64,
     pub bytes: u64,
+    /// Failures at the connection or accept layer, and the connects refused for capacity. The
+    /// reference keeps them apart from the protocol counters for exactly that reason.
+    pub network_errors: u64,
+    pub rejected: u64,
 }
 
 impl Statistics {
@@ -190,7 +199,11 @@ impl Statistics {
         self.completions = self.completions.wrapping_add(other.completions);
         self.receives = self.receives.wrapping_add(other.receives);
         self.sends = self.sends.wrapping_add(other.sends);
+        self.received_bytes = self.received_bytes.wrapping_add(other.received_bytes);
+        self.sent_bytes = self.sent_bytes.wrapping_add(other.sent_bytes);
         self.bytes = self.bytes.wrapping_add(other.bytes);
+        self.network_errors = self.network_errors.wrapping_add(other.network_errors);
+        self.rejected = self.rejected.wrapping_add(other.rejected);
     }
 
     /// One line per TCP worker, printed after that worker has joined.
@@ -201,22 +214,41 @@ impl Statistics {
         )
     }
 
-    /// The aggregate terminal line. TCP reports the connections still active, UDP the
-    /// requests still outstanding; the rate is guarded against a zero-millisecond run.
-    pub fn final_line(&self, protocol: Protocol, elapsed_milliseconds: u64, terminal_count: u32) -> String {
+    /// The aggregate terminal line, in the reference's field order for both protocols: the only
+    /// differences between them are the protocol name and the value of `outstanding`. `active` is
+    /// reported as the reference reports it, which is always zero because every worker has joined
+    /// before the line is printed. The rate is guarded against a zero-millisecond run.
+    pub fn final_line(
+        &self,
+        protocol: Protocol,
+        elapsed_milliseconds: u64,
+        worker_count: u32,
+        outstanding: u32,
+    ) -> String {
         let guarded = elapsed_milliseconds.max(1);
         let rate = self.bytes as f64 / (1024.0 * 1024.0) / (guarded as f64 / 1000.0);
-        match protocol {
-            Protocol::Udp => format!(
-                "final protocol=udp elapsed_ms={} completions={} receives={} sends={} bytes={} MiB_per_sec={:.2} outstanding={}",
-                elapsed_milliseconds, self.completions, self.receives, self.sends, self.bytes, rate, terminal_count
-            ),
-            _ => format!(
-                "final protocol=tcp elapsed_ms={} accepted={} completions={} receives={} sends={} bytes={} MiB_per_sec={:.2} active={}",
-                elapsed_milliseconds, self.accepted, self.completions, self.receives, self.sends, self.bytes, rate,
-                terminal_count
-            ),
-        }
+        let name = match protocol {
+            Protocol::Udp => "udp",
+            _ => "tcp",
+        };
+        format!(
+            "final protocol={} elapsed_ms={} workers={} accepted={} active=0 outstanding={} completions={} \
+receives={} sends={} received_bytes={} sent_bytes={} bytes={} network_errors={} rejected={} MiB_per_sec={:.2}",
+            name,
+            elapsed_milliseconds,
+            worker_count,
+            self.accepted,
+            outstanding,
+            self.completions,
+            self.receives,
+            self.sends,
+            self.received_bytes,
+            self.sent_bytes,
+            self.bytes,
+            self.network_errors,
+            self.rejected,
+            rate
+        )
     }
 }
 #[cfg(test)]
@@ -264,8 +296,22 @@ mod tests {
     #[test]
     fn statistics_aggregate_exactly_and_format_like_the_baseline() {
         let mut total = Statistics::default();
-        total.merge(&Statistics { accepted: 3, completions: 11, receives: 5, sends: 6, bytes: 4096 });
-        total.merge(&Statistics { accepted: 7, completions: 19, receives: 9, sends: 10, bytes: 8192 });
+        total.merge(&Statistics {
+            accepted: 3,
+            completions: 11,
+            receives: 5,
+            sends: 6,
+            bytes: 4096,
+            ..Statistics::default()
+        });
+        total.merge(&Statistics {
+            accepted: 7,
+            completions: 19,
+            receives: 9,
+            sends: 10,
+            bytes: 8192,
+            ..Statistics::default()
+        });
         assert_eq!(total.accepted, 10);
         assert_eq!(total.completions, 30);
         assert_eq!(total.receives, 14);
@@ -276,13 +322,17 @@ mod tests {
             "[worker 1] accepted=10 completions=30 receives=14 sends=16 bytes=12288 active=0"
         );
         assert_eq!(
-            total.final_line(Protocol::Tcp, 500, 0),
-            "final protocol=tcp elapsed_ms=500 accepted=10 completions=30 receives=14 sends=16 bytes=12288 MiB_per_sec=0.02 active=0"
+            total.final_line(Protocol::Tcp, 500, 4, 0),
+            "final protocol=tcp elapsed_ms=500 workers=4 accepted=10 active=0 outstanding=0 \
+completions=30 receives=14 sends=16 received_bytes=0 sent_bytes=0 bytes=12288 network_errors=0 rejected=0 \
+MiB_per_sec=0.02"
         );
         assert_eq!(
-            total.final_line(Protocol::Udp, 0, 0),
+            total.final_line(Protocol::Udp, 0, 1, 3),
             // A zero-millisecond run is guarded to 1 ms, so the rate is 12288 bytes per millisecond.
-            "final protocol=udp elapsed_ms=0 completions=30 receives=14 sends=16 bytes=12288 MiB_per_sec=11.72 outstanding=0"
+            "final protocol=udp elapsed_ms=0 workers=1 accepted=10 active=0 outstanding=3 \
+completions=30 receives=14 sends=16 received_bytes=0 sent_bytes=0 bytes=12288 network_errors=0 rejected=0 \
+MiB_per_sec=11.72"
         );
 
         // Large values wrap exactly instead of saturating, matching the C++ counters.

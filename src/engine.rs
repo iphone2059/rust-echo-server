@@ -432,9 +432,11 @@ mod tests {
         engine.on_completion(0, EngineOperation::Send, 0, 8, 0);
         let line = engine.statistics.worker_line(0, engine.active_count());
         assert_eq!(line, "[worker 0] accepted=1 completions=2 receives=1 sends=1 bytes=8 active=1");
-        let final_line = engine.statistics.final_line(Protocol::Tcp, 1_000, engine.active_count());
-        assert!(final_line.starts_with("final protocol=tcp elapsed_ms=1000 accepted=1 "));
-        assert!(final_line.ends_with(" active=1"));
+        let final_line = engine.statistics.final_line(Protocol::Tcp, 1_000, 1, engine.active_count());
+        assert!(final_line.starts_with(
+            "final protocol=tcp elapsed_ms=1000 workers=1 accepted=1 active=0 outstanding=1 "
+        ));
+        assert!(final_line.contains(" received_bytes=0 sent_bytes=0 bytes=8 network_errors=0 rejected=0 MiB_per_sec="));
     }
 }
 
