@@ -755,14 +755,22 @@ pub mod udp {
             slot.outstanding = false;
             self.outstanding -= 1;
             self.statistics.completions = self.statistics.completions.wrapping_add(1);
-            match slot.operation {
-                EngineOperation::Receive => {
-                    self.statistics.receives = self.statistics.receives.wrapping_add(1);
-                }
-                EngineOperation::Send => {
-                    self.statistics.sends = self.statistics.sends.wrapping_add(1);
-                    if status == ERROR_SUCCESS {
-                        self.statistics.bytes = self.statistics.bytes.wrapping_add(u64::from(bytes));
+            // Only a successful completion is traffic. A cancelled or failed one still counts as a
+            // completion, which is how the reference counts them, but it is not a receive or a send and
+            // it carries no bytes in either direction.
+            if status == ERROR_SUCCESS {
+                let transferred = u64::from(bytes);
+                match slot.operation {
+                    EngineOperation::Receive => {
+                        self.statistics.receives = self.statistics.receives.wrapping_add(1);
+                        self.statistics.received_bytes =
+                            self.statistics.received_bytes.wrapping_add(transferred);
+                    }
+                    EngineOperation::Send => {
+                        self.statistics.sends = self.statistics.sends.wrapping_add(1);
+                        self.statistics.sent_bytes =
+                            self.statistics.sent_bytes.wrapping_add(transferred);
+                        self.statistics.bytes = self.statistics.bytes.wrapping_add(transferred);
                     }
                 }
             }
@@ -890,7 +898,12 @@ pub mod udp {
             assert_eq!(engine.slot(0).unwrap().payload_length, 65_507);
             assert!(!engine.failed);
             assert!(!engine.closing);
-            assert_eq!(engine.statistics.sends, 1);
+            // The reset send is a completion but not traffic: it is not reported as a send and carries
+            // no bytes, exactly as the reference counts a cancelled or failed completion.
+            assert_eq!(engine.statistics.sends, 0);
+            assert_eq!(engine.statistics.sent_bytes, 0);
+            assert_eq!(engine.statistics.receives, 1);
+            assert_eq!(engine.statistics.completions, 2);
         }
 
         #[test]
