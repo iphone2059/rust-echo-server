@@ -17,6 +17,9 @@ pub mod token {
     pub const MISSING_VALUE: &str = "missing-value";
     pub const MISSING_PROTOCOL: &str = "missing-protocol";
     pub const UNEXPECTED_TARGET: &str = "unexpected-target";
+    pub const PAYLOAD_SIZE: &str = "payload-size";
+    pub const CQ_CAPACITY: &str = "cq-capacity";
+    pub const MEMORY_CAPACITY: &str = "memory-capacity";
 }
 
 /// Usage text, one entry per line; printed on stdout for a valid /h command line.
@@ -41,6 +44,24 @@ pub fn checked_product(a: u64, b: u64) -> Option<u64> {
 
 pub fn checked_arena_bytes(slots: u64, stride: u64, memory_limit: u64) -> Option<u64> {
     checked_product(slots, stride).filter(|bytes| *bytes <= memory_limit)
+}
+
+/// ws2def.h: the reference sizes a datagram slot as the payload plus SOCKADDR_STORAGE and its
+/// sixteen trailing bytes, which is the stride its arena uses.
+pub const UDP_ADDRESS_BYTES: u64 = 144;
+/// The page the reference rounds a worker's memory share to when GetSystemInfo cannot answer.
+pub const PAGE_BYTES: u64 = 4096;
+
+/// One worker's share of /memory, rounded down to whole pages with the remainder handed to the
+/// first workers: the reference's ces_worker_memory_budget.
+pub fn worker_memory_budget(memory_bytes: u64, worker_count: u32, worker_index: u32, page: u64) -> u64 {
+    if worker_count == 0 || page == 0 {
+        return 0;
+    }
+    let pages = memory_bytes / page;
+    let share = pages / u64::from(worker_count);
+    let extra = u64::from(worker_index) < pages % u64::from(worker_count);
+    (share + u64::from(extra)) * page
 }
 
 pub fn tcp_connection_capacity(cq_capacity: u32, memory_slots: u64) -> u32 {
@@ -227,27 +248,58 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     if options.protocol == Protocol::Tcp && saw_udp_depth {
         return Err(ArgumentError(crate::contract::token::PROTOCOL_OPTION.to_string()));
     }
-    if options.protocol == Protocol::Udp && saw_timeout {
+    if options.protocol == Protocol::Udp && (saw_timeout || saw_workers) {
         return Err(ArgumentError(crate::contract::token::PROTOCOL_OPTION.to_string()));
     }
     // Option validation precedes the help short-circuit, exactly like the reference: /h never
     // masks a malformed command line.
-    if options.help {
-        return Ok(options);
-    }
-    if options.protocol == Protocol::None {
-        return Err(ArgumentError("missing-protocol".to_string()));
-    }
+    // Capacity is validated before the help short-circuit, exactly like the reference: /h never
+    // masks a budget the run could not satisfy, only the mandatory-protocol check.
     if options.protocol == Protocol::Udp {
+        // The datagram path is single-threaded in the reference whatever /threads says.
+        options.worker_count = 1;
         if !saw_rio_buffer {
             // UDP defaults to one maximum-sized datagram per slot; the depth keeps its
             // own default.
             options.rio_buffer_bytes = MAXIMUM_UDP_PAYLOAD_BYTES as u32;
         } else if u64::from(options.rio_buffer_bytes) < MAXIMUM_UDP_PAYLOAD_BYTES {
-            return Err(ArgumentError(
-                "UDP /rio-buffer must be at least 65507 bytes".to_string(),
-            ));
+            return Err(ArgumentError(token::PAYLOAD_SIZE.to_string()));
         }
+        // Each datagram slot reserves a queue entry per direction.
+        if options.udp_depth > options.cq_capacity / 2 {
+            return Err(ArgumentError(token::CQ_CAPACITY.to_string()));
+        }
+        let stride = u64::from(options.rio_buffer_bytes) + UDP_ADDRESS_BYTES;
+        match checked_arena_bytes(u64::from(options.udp_depth), stride, options.memory_bytes) {
+            Some(bytes) if bytes <= u64::from(u32::MAX) => {}
+            _ => return Err(ArgumentError(token::MEMORY_CAPACITY.to_string())),
+        }
+    }
+    if options.protocol == Protocol::Tcp {
+        // Every worker needs a page-rounded share of /memory that can hold at least one slot;
+        // otherwise it cannot register its arena at all.
+        let workers = if options.worker_count == 0 {
+            crate::types::resolved_worker_count(
+                options.worker_count,
+                crate::native::active_processor_count(),
+            )
+        } else {
+            options.worker_count
+        };
+        for index in 0..workers {
+            let budget = worker_memory_budget(options.memory_bytes, workers, index, PAGE_BYTES);
+            let slots =
+                (u64::from(options.cq_capacity) / 2).min(budget / u64::from(options.rio_buffer_bytes));
+            if slots == 0 {
+                return Err(ArgumentError(token::MEMORY_CAPACITY.to_string()));
+            }
+        }
+    }
+    if options.help {
+        return Ok(options);
+    }
+    if options.protocol == Protocol::None {
+        return Err(ArgumentError(token::MISSING_PROTOCOL.to_string()));
     }
     Ok(options)
 }
