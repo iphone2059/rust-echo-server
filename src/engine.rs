@@ -7,6 +7,10 @@
 
 use crate::connection::{Connection, ConnectionStep};
 use crate::worker::timer::TimerHeap;
+/// winerror.h: a completion the close path aborted. The reference does not count our own
+/// cancellation as a network failure, so this status is filtered out of that counter.
+const ERROR_OPERATION_ABORTED: i32 = 995;
+
 use crate::types::{worker_may_exit, EngineOperation, Statistics, WorkerLifecycle, WorkerPhase};
 
 /// One decision the native layer has to carry out.
@@ -160,7 +164,7 @@ impl TcpEngine {
                     self.statistics.bytes = self.statistics.bytes.wrapping_add(transferred);
                 }
             }
-        } else {
+        } else if status != ERROR_OPERATION_ABORTED {
             // A failed completion is a connection failure. Counting it here is what makes a peer
             // that resets report one error per established connection, exactly as the reference
             // does: that many receives were outstanding when the connection went away.
