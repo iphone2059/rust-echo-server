@@ -3,13 +3,13 @@
 //! This is the counterpart of `ces_run_server`: RIO is loaded once through a probe socket
 //! and every protocol runs against that table. There is no fallback data path.
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use crate::native::{registered_socket, report, RioFunctions, Winsock};
-use crate::worker::tcp::run_tcp;
+use crate::native::{RioFunctions, Winsock, registered_socket, report};
 use crate::types::{ExitCode, Options, Protocol};
 use crate::udp::runtime::run_udp;
+use crate::worker::tcp::run_tcp;
 
 /// Runs one parsed command line. `stop_requested` is the console handler's flag: the
 /// engine observes it between drain batches, not only between iterations.
@@ -46,6 +46,3 @@ pub fn run_server(options: &Options, stop_requested: &Arc<AtomicBool>) -> ExitCo
     drop(winsock);
     result
 }
-
-
-

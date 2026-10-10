@@ -13,15 +13,17 @@ use core::ptr;
 
 use windows::Win32::errhandlingapi::GetLastError;
 use windows::Win32::handleapi::CloseHandle;
-use windows::Win32::mswsock::{LPFN_ACCEPTEX, RIO_EXTENSION_FUNCTION_TABLE};
+use windows::Win32::mswsock::{
+    LPFN_ACCEPTEX, LPFN_GETACCEPTEXSOCKADDRS, RIO_EXTENSION_FUNCTION_TABLE,
+};
 use windows::Win32::winsock2::{
-    SOCKET, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSACleanup, WSADATA, WSASocketW,
-    WSAStartup, WSAIoctl, closesocket, setsockopt, INVALID_SOCKET,
+    INVALID_SOCKET, SOCKET, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSACleanup, WSADATA,
+    WSAIoctl, WSASocketW, WSAStartup, closesocket, setsockopt,
 };
 use windows::Win32::ws2::{
     AF_INET, IPPROTO_TCP, IPPROTO_UDP, SIO_GET_EXTENSION_FUNCTION_POINTER,
-    SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, SOCK_DGRAM,
-    SOCK_STREAM, TCP_NODELAY,
+    SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SO_RCVBUF, SO_SNDBUF, SOCK_DGRAM, SOCK_STREAM,
+    SOL_SOCKET, TCP_NODELAY,
 };
 use windows::Win32::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::core::GUID;
@@ -39,7 +41,17 @@ impl NativeError {
     /// Captures the thread's last-error value at the failing call site; the value is never
     /// read back later, when another Win32 call would have overwritten it.
     pub fn last(stage: &'static str) -> Self {
-        Self { stage, code: unsafe { GetLastError() } as i32 }
+        Self {
+            stage,
+            code: unsafe { GetLastError() } as i32,
+        }
+    }
+
+    pub fn winsock(stage: &'static str) -> Self {
+        Self {
+            stage,
+            code: unsafe { windows::Win32::winsock2::WSAGetLastError() },
+        }
     }
 
     pub fn code(stage: &'static str, code: i32) -> Self {
@@ -57,7 +69,10 @@ impl Winsock {
         let mut data = WSADATA::default();
         let status = unsafe { WSAStartup(0x0202, &mut data) };
         if status != 0 {
-            return Err(NativeError { stage: "WSAStartup", code: status });
+            return Err(NativeError {
+                stage: "WSAStartup",
+                code: status,
+            });
         }
         Ok(Self { started: true })
     }
@@ -156,14 +171,17 @@ pub fn registered_socket(protocol: Protocol) -> Result<SocketOwner, NativeError>
         Protocol::Udp => (SOCK_DGRAM, IPPROTO_UDP),
         Protocol::None => {
             // 87 = ERROR_INVALID_PARAMETER, matching the baseline's rejected-protocol path.
-            return Err(NativeError { stage: "registered_socket(protocol)", code: 87 });
+            return Err(NativeError {
+                stage: "registered_socket(protocol)",
+                code: 87,
+            });
         }
     };
     // The bindings expose the WSA_FLAG_* constants as i32; dwflags is u32.
     let flags = (WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO) as u32;
     let socket = unsafe { WSASocketW(AF_INET, kind, transport, None, 0, flags) };
     if socket == INVALID_SOCKET {
-        return Err(NativeError::last("WSASocketW(AF_INET, registered)"));
+        return Err(NativeError::winsock("WSASocketW(AF_INET, registered)"));
     }
     Ok(SocketOwner::new(socket))
 }
@@ -188,7 +206,7 @@ pub fn configure_socket(socket: SOCKET, tcp: bool, buffer_bytes: u32) -> Result<
                 )
             };
             if status != 0 {
-                return Err(NativeError::last(stage));
+                return Err(NativeError::winsock(stage));
             }
         }
     }
@@ -204,7 +222,7 @@ pub fn configure_socket(socket: SOCKET, tcp: bool, buffer_bytes: u32) -> Result<
             )
         };
         if status != 0 {
-            return Err(NativeError::last("setsockopt(TCP_NODELAY)"));
+            return Err(NativeError::winsock("setsockopt(TCP_NODELAY)"));
         }
     }
     Ok(())
@@ -217,6 +235,7 @@ const WSAID_MULTIPLE_RIO: GUID = GUID::from_u128(0x8509_e081_96dd_4005_b165_9e2e
 
 /// {B5367DF1-CBAC-11CF-95CA-00805F48A192}: the AcceptEx identifier.
 const WSAID_ACCEPTEX: GUID = GUID::from_u128(0xb536_7df1_cbac_11cf_95ca_0080_5f48_a192);
+const WSAID_GETACCEPTEXSOCKADDRS: GUID = GUID::from_u128(0xb536_7df2_cbac_11cf_95ca_0080_5f48_a192);
 
 /// The RIO entry points. RIO is never imported as a flat symbol: every function is
 /// reached through this table, which the provider fills in for the running stack. The
@@ -247,12 +266,32 @@ impl RioFunctions {
             )
         };
         if status != 0 {
-            return Err(NativeError::last(
+            return Err(NativeError::winsock(
                 "WSAIoctl(SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER)",
             ));
         }
         if returned != expected || table.cbSize != expected {
-            return Err(NativeError { stage: "RIO table size", code: 13 });
+            return Err(NativeError {
+                stage: "RIO table size",
+                code: 13,
+            });
+        }
+        if table.RIOReceive.is_none()
+            || table.RIOReceiveEx.is_none()
+            || table.RIOSend.is_none()
+            || table.RIOSendEx.is_none()
+            || table.RIOCreateCompletionQueue.is_none()
+            || table.RIOCloseCompletionQueue.is_none()
+            || table.RIOCreateRequestQueue.is_none()
+            || table.RIODequeueCompletion.is_none()
+            || table.RIONotify.is_none()
+            || table.RIORegisterBuffer.is_none()
+            || table.RIODeregisterBuffer.is_none()
+        {
+            return Err(NativeError {
+                stage: "RIO table entry points",
+                code: 13,
+            });
         }
         Ok(Self { table })
     }
@@ -306,6 +345,44 @@ pub fn active_processor_count() -> u32 {
     unsafe { windows::Win32::winbase::GetActiveProcessorCount(0xFFFF) }
 }
 
+pub fn page_bytes() -> u64 {
+    let mut info = windows::Win32::sysinfoapi::SYSTEM_INFO::default();
+    unsafe { windows::Win32::sysinfoapi::GetSystemInfo(&mut info) };
+    if info.dwPageSize == 0 {
+        crate::contract::PAGE_BYTES
+    } else {
+        u64::from(info.dwPageSize)
+    }
+}
+
+/// Diagnostics are opt-in and never affect the run's exit code or standard streams.
+/// Callers pass snapshots only after all owning loops have stopped and joined.
+pub fn write_diagnostics(values: &[crate::types::NotifySnapshot], protocol: Protocol) {
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(path) = std::env::var_os("CES_DIAG_FILE") else {
+        return;
+    };
+    if path.is_empty() || path.encode_wide().count() >= 512 {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(1)
+        .open(path)
+    else {
+        return;
+    };
+    for snapshot in values {
+        if file.write_all(snapshot.line(protocol).as_bytes()).is_err() {
+            break;
+        }
+    }
+}
+
 /// Loads the AcceptEx entry point for the listener. The extension belongs to that socket
 /// and stays valid while the socket lives.
 pub fn load_accept_ex(listener: SOCKET) -> Result<LPFN_ACCEPTEX, NativeError> {
@@ -325,10 +402,43 @@ pub fn load_accept_ex(listener: SOCKET) -> Result<LPFN_ACCEPTEX, NativeError> {
         )
     };
     if status != 0 {
-        return Err(NativeError::last("WSAIoctl(WSAID_ACCEPTEX)"));
+        return Err(NativeError::winsock("WSAIoctl(WSAID_ACCEPTEX)"));
     }
-    if function.is_none() {
-        return Err(NativeError { stage: "AcceptEx entry point", code: 13 });
+    if function.is_none() || returned != size_of::<LPFN_ACCEPTEX>() as u32 {
+        return Err(NativeError {
+            stage: "AcceptEx entry point",
+            code: 13,
+        });
+    }
+    Ok(function)
+}
+
+pub fn load_accept_addresses(listener: SOCKET) -> Result<LPFN_GETACCEPTEXSOCKADDRS, NativeError> {
+    let mut function: LPFN_GETACCEPTEXSOCKADDRS = None;
+    let mut returned: u32 = 0;
+    let status = unsafe {
+        WSAIoctl(
+            listener,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            Some(&WSAID_GETACCEPTEXSOCKADDRS as *const GUID as *const c_void),
+            size_of::<GUID>() as u32,
+            Some(&mut function as *mut LPFN_GETACCEPTEXSOCKADDRS as *mut c_void),
+            size_of::<LPFN_GETACCEPTEXSOCKADDRS>() as u32,
+            &mut returned,
+            None,
+            None,
+        )
+    };
+    if status != 0 {
+        return Err(NativeError::winsock(
+            "SIO_GET_EXTENSION_FUNCTION_POINTER(GetAcceptExSockaddrs)",
+        ));
+    }
+    if function.is_none() || returned != size_of::<LPFN_GETACCEPTEXSOCKADDRS>() as u32 {
+        return Err(NativeError {
+            stage: "GetAcceptExSockaddrs entry point",
+            code: 13,
+        });
     }
     Ok(function)
 }
@@ -348,8 +458,8 @@ pub mod arena {
     use windows::Win32::memoryapi::{VirtualAlloc, VirtualFree};
     use windows::Win32::mswsockdef::RIO_BUF;
 
-    use crate::native::{report, NativeError, RioFunctions};
     use crate::native::rio::RegisteredBuffer;
+    use crate::native::{NativeError, RioFunctions, report};
 
     // VirtualAlloc/VirtualFree flag values from winnt.h. The generated tree does not expose
     // them under memoryapi, and the API takes plain u32 flags.
@@ -378,7 +488,9 @@ pub mod arena {
 
     /// Stride of a UDP slot: the datagram buffer plus the address area the completion writes.
     pub fn udp_stride(rio_buffer_bytes: u32, address_bytes: usize) -> Option<u32> {
-        (rio_buffer_bytes as usize).checked_add(address_bytes).and_then(|value| u32::try_from(value).ok())
+        (rio_buffer_bytes as usize)
+            .checked_add(address_bytes)
+            .and_then(|value| u32::try_from(value).ok())
     }
 
     /// Releases the pages and reports whether Windows accepted the release. Every Win32 result
@@ -387,37 +499,52 @@ pub mod arena {
         unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }.as_bool()
     }
 
-    /// A registered block of memory. The registration is process-scoped and stays alive for
-    /// the lifetime of the engine; dropping releases the pages, so callers must have stopped
-    /// posting operations first.
+    /// One allocation with an independent registration for every fixed-stride slot. RIO
+    /// reserves an entire registration during a send, even when the descriptor uses only
+    /// part of it, so concurrently active slots must never share a BufferId.
+    /// Dropping deregisters every slot before releasing the allocation's pages.
     pub struct Arena {
         base: *mut u8,
         bytes: usize,
-        registered: RegisteredBuffer,
+        stride: u32,
+        registered: Vec<RegisteredBuffer>,
     }
 
     impl Arena {
-        pub fn create(rio: &RioFunctions, bytes: usize) -> Result<Self, NativeError> {
-            if bytes == 0 {
-                return Err(NativeError { stage: "arena size", code: 13 });
+        pub fn create(rio: &RioFunctions, bytes: usize, stride: u32) -> Result<Self, NativeError> {
+            if bytes == 0
+                || bytes > u32::MAX as usize
+                || stride == 0
+                || bytes % stride as usize != 0
+            {
+                return Err(NativeError {
+                    stage: "arena size",
+                    code: 13,
+                });
             }
-            let base = unsafe { VirtualAlloc(None, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as *mut u8;
+            let registered = Vec::with_capacity(bytes / stride as usize);
+            let base =
+                unsafe { VirtualAlloc(None, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }
+                    as *mut u8;
             if base.is_null() {
-                return Err(NativeError { stage: "VirtualAlloc(arena)", code: 8 });
+                return Err(NativeError::last("VirtualAlloc(arena)"));
             }
-            let slice = unsafe { core::slice::from_raw_parts_mut(base, bytes) };
-            let registered = match RegisteredBuffer::register(rio, slice) {
-                Ok(buffer) => buffer,
-                Err(error) => {
-                    // The pages must not leak when registration is refused, and the release has to run in
-                    // every build: debug_assert! does not evaluate its argument in a release build.
-                    if !release_pages(base) {
-                        report("VirtualFree(arena)", 13);
-                    }
-                    return Err(error);
-                }
+            let mut arena = Self {
+                base,
+                bytes,
+                stride,
+                registered,
             };
-            Ok(Self { base, bytes, registered })
+            for offset in (0..bytes).step_by(stride as usize) {
+                let slice =
+                    unsafe { core::slice::from_raw_parts_mut(base.add(offset), stride as usize) };
+                // On a failed registration, Arena::drop deregisters the preceding slots
+                // before freeing the pages. A failed BufferId is never added to the owners.
+                arena
+                    .registered
+                    .push(RegisteredBuffer::register(rio, slice)?);
+            }
+            Ok(arena)
         }
 
         pub fn bytes(&self) -> usize {
@@ -428,56 +555,87 @@ pub mod arena {
             self.base
         }
 
-        pub fn registration(&self) -> windows::Win32::mswsockdef::RIO_BUFFERID {
-            self.registered.raw()
-        }
-
         /// Borrows a bounded window of the arena. The bounds are re-checked here so no caller
         /// can widen a view by accident.
         pub fn window(&mut self, offset: u32, length: u32) -> Result<&mut [u8], NativeError> {
             let start = offset as usize;
             let len = length as usize;
             if len == 0 || start > self.bytes || len > self.bytes - start {
-                return Err(NativeError { stage: "arena window bounds", code: 13 });
+                return Err(NativeError {
+                    stage: "arena window bounds",
+                    code: 13,
+                });
             }
             Ok(unsafe { core::slice::from_raw_parts_mut(self.base.add(start), len) })
         }
 
-        /// A RIO descriptor for a region, checked against the arena size and the registration.
+        /// Maps a global arena offset to its slot's registration and local RIO offset.
+        /// A view must fit entirely within that one registration.
         pub fn view(&self, offset: u32, length: u32) -> Result<RIO_BUF, NativeError> {
             if offset as usize >= self.bytes {
-                return Err(NativeError { stage: "arena view offset", code: 13 });
+                return Err(NativeError {
+                    stage: "arena view offset",
+                    code: 13,
+                });
             }
-            self.registered.slice(offset, length)
+            let index = (offset / self.stride) as usize;
+            self.registered[index].slice(offset % self.stride, length)
         }
 
         /// A RIO descriptor for one fixed-stride slot.
         pub fn slot_view(&self, index: u32, stride: u32) -> Result<RIO_BUF, NativeError> {
-            let offset = slot_offset(index, stride, self.bytes)
-                .ok_or(NativeError { stage: "arena slot offset", code: 13 })?;
-            self.registered.slice(offset as u32, stride)
+            if stride != self.stride {
+                return Err(NativeError {
+                    stage: "arena slot stride",
+                    code: 13,
+                });
+            }
+            let offset = slot_offset(index, stride, self.bytes).ok_or(NativeError {
+                stage: "arena slot offset",
+                code: 13,
+            })?;
+            self.view(offset as u32, stride)
         }
 
         /// A RIO descriptor for the tail of a slot, used for the UDP remote-address area.
-        pub fn slot_tail_view(&self, index: u32, stride: u32, tail_offset: u32, tail_length: u32)
-            -> Result<RIO_BUF, NativeError>
-        {
-            let offset = slot_offset(index, stride, self.bytes)
-                .ok_or(NativeError { stage: "arena slot offset", code: 13 })?;
-            if tail_offset as usize > stride as usize || tail_length as usize > stride as usize - tail_offset as usize {
-                return Err(NativeError { stage: "arena slot tail bounds", code: 13 });
+        pub fn slot_tail_view(
+            &self,
+            index: u32,
+            stride: u32,
+            tail_offset: u32,
+            tail_length: u32,
+        ) -> Result<RIO_BUF, NativeError> {
+            if stride != self.stride {
+                return Err(NativeError {
+                    stage: "arena slot stride",
+                    code: 13,
+                });
+            }
+            let offset = slot_offset(index, stride, self.bytes).ok_or(NativeError {
+                stage: "arena slot offset",
+                code: 13,
+            })?;
+            if tail_offset as usize > stride as usize
+                || tail_length as usize > stride as usize - tail_offset as usize
+            {
+                return Err(NativeError {
+                    stage: "arena slot tail bounds",
+                    code: 13,
+                });
             }
             let start = offset + tail_offset as usize;
-            self.registered.slice(start as u32, tail_length)
+            self.view(start as u32, tail_length)
         }
     }
 
     impl Arena {
-        /// Releases the region the way both baselines do: deregister with RIO first, then free
+        /// Releases the allocation: deregister every slot with RIO first, then free
         /// the pages. The engine calls this once every posted request has completed and the
-        /// owning threads have joined.
+        /// owning loops have fully drained.
         pub fn destroy(&mut self, rio: &RioFunctions) {
-            self.registered.deregister(rio);
+            for registered in &mut self.registered {
+                registered.deregister(rio);
+            }
             self.release_pages();
         }
 
@@ -486,7 +644,8 @@ pub mod arena {
                 // Free first, then forget the address, in every build. A debug_assert! skipped the free in
                 // a release build and then cleared the pointer, so the whole region leaked silently.
                 if !release_pages(self.base) {
-                    report("VirtualFree(arena)", 13);
+                    let error = NativeError::last("VirtualFree(arena)");
+                    report(error.stage, error.code);
                 }
                 self.base = core::ptr::null_mut();
                 self.bytes = 0;
@@ -496,8 +655,10 @@ pub mod arena {
 
     impl Drop for Arena {
         fn drop(&mut self) {
-            // Fallback for a partially initialised engine that never reached its explicit
-            // tear-down; the registration is process-scoped in that case.
+            // A partially initialized runtime still deregisters before releasing pages.
+            for registered in &mut self.registered {
+                registered.close();
+            }
             self.release_pages();
         }
     }
@@ -566,9 +727,15 @@ pub mod endpoint {
     /// failure through the socket API's own error value.
     pub fn bind_endpoint(socket: SOCKET, port: u16) -> Result<(), NativeError> {
         let address = any_endpoint(port);
-        let status = unsafe { bind(socket, sockaddr_ptr(&address), size_of::<SOCKADDR_IN>() as i32) };
+        let status = unsafe {
+            bind(
+                socket,
+                sockaddr_ptr(&address),
+                size_of::<SOCKADDR_IN>() as i32,
+            )
+        };
         if status != 0 {
-            return Err(NativeError::last("bind"));
+            return Err(NativeError::winsock("bind"));
         }
         Ok(())
     }
@@ -577,7 +744,7 @@ pub mod endpoint {
     pub fn listen_endpoint(socket: SOCKET) -> Result<(), NativeError> {
         let status = unsafe { listen(socket, 2_147_483_647) };
         if status != 0 {
-            return Err(NativeError::last("listen"));
+            return Err(NativeError::winsock("listen"));
         }
         Ok(())
     }
@@ -595,7 +762,7 @@ pub mod endpoint {
             )
         };
         if status != 0 {
-            return Err(NativeError::last("setsockopt(SO_UPDATE_ACCEPT_CONTEXT)"));
+            return Err(NativeError::winsock("setsockopt(SO_UPDATE_ACCEPT_CONTEXT)"));
         }
         Ok(())
     }
@@ -636,7 +803,9 @@ pub mod rio {
         RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION, RIO_NOTIFICATION_COMPLETION_0,
         RIO_NOTIFICATION_COMPLETION_0_1,
     };
-    use windows::Win32::mswsockdef::{RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_RQ, RIORESULT};
+    use windows::Win32::mswsockdef::{
+        RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_INVALID_BUFFERID, RIO_RQ, RIORESULT,
+    };
     use windows::Win32::winsock2::SOCKET;
     use windows::Win32::{HANDLE, INVALID_HANDLE_VALUE};
 
@@ -664,11 +833,12 @@ pub mod rio {
         /// Associates a socket with this port so its overlapped I/O completes here. The
         /// listener uses this to publish AcceptEx completions.
         pub fn associate_socket(&self, socket: SOCKET) -> Result<(), NativeError> {
-            let associated = unsafe {
-                CreateIoCompletionPort(socket as HANDLE, Some(self.handle), 0, 1)
-            };
+            let associated =
+                unsafe { CreateIoCompletionPort(socket as HANDLE, Some(self.handle), 0, 1) };
             if associated != self.handle {
-                return Err(NativeError::last("CreateIoCompletionPort(listener association)"));
+                return Err(NativeError::last(
+                    "CreateIoCompletionPort(listener association)",
+                ));
             }
             Ok(())
         }
@@ -679,7 +849,11 @@ pub mod rio {
                     self.handle,
                     0,
                     key,
-                    if overlapped.is_null() { None } else { Some(overlapped as *mut windows::Win32::minwinbase::OVERLAPPED) },
+                    if overlapped.is_null() {
+                        None
+                    } else {
+                        Some(overlapped as *mut windows::Win32::minwinbase::OVERLAPPED)
+                    },
                 )
             };
             if !posted.as_bool() {
@@ -706,6 +880,7 @@ pub mod rio {
         queue: RIO_CQ,
         capacity: u32,
         armed: bool,
+        rio: RioFunctions,
     }
 
     impl CompletionQueue {
@@ -717,12 +892,15 @@ pub mod rio {
             overlapped: *mut c_void,
         ) -> Result<Self, NativeError> {
             if capacity == 0 {
-                return Err(NativeError { stage: "RIOCreateCompletionQueue capacity", code: 13 });
+                return Err(NativeError {
+                    stage: "RIOCreateCompletionQueue capacity",
+                    code: 13,
+                });
             }
-            let create = rio
-                .table()
-                .RIOCreateCompletionQueue
-                .ok_or(NativeError { stage: "RIOCreateCompletionQueue entry point", code: 13 })?;
+            let create = rio.table().RIOCreateCompletionQueue.ok_or(NativeError {
+                stage: "RIOCreateCompletionQueue entry point",
+                code: 13,
+            })?;
             let mut notification = RIO_NOTIFICATION_COMPLETION::default();
             notification.Type = RIO_IOCP_COMPLETION;
             notification.Anonymous = RIO_NOTIFICATION_COMPLETION_0 {
@@ -732,11 +910,21 @@ pub mod rio {
                     Overlapped: overlapped,
                 },
             };
-            let queue = unsafe { create(capacity, &mut notification as *mut RIO_NOTIFICATION_COMPLETION) };
+            let queue = unsafe {
+                create(
+                    capacity,
+                    &mut notification as *mut RIO_NOTIFICATION_COMPLETION,
+                )
+            };
             if queue.is_null() {
-                return Err(NativeError::last("RIOCreateCompletionQueue"));
+                return Err(NativeError::winsock("RIOCreateCompletionQueue"));
             }
-            Ok(Self { queue, capacity, armed: false })
+            Ok(Self {
+                queue,
+                capacity,
+                armed: false,
+                rio: *rio,
+            })
         }
 
         pub fn raw(&self) -> RIO_CQ {
@@ -755,17 +943,27 @@ pub mod rio {
         /// is refused: the baseline treats a duplicate RIONotify as an invariant violation.
         pub fn arm(&mut self, rio: &RioFunctions) -> Result<(), NativeError> {
             if self.armed {
-                return Err(NativeError { stage: "duplicate RIONotify", code: 5023 });
+                return Err(NativeError {
+                    stage: "duplicate RIONotify",
+                    code: 5023,
+                });
             }
-            let notify = rio
-                .table()
-                .RIONotify
-                .ok_or(NativeError { stage: "RIONotify entry point", code: 13 })?;
+            let notify = rio.table().RIONotify.ok_or(NativeError {
+                stage: "RIONotify entry point",
+                code: 13,
+            })?;
             // Only ERROR_SUCCESS is accepted: any other status leaves the queue unarmed and the
             // caller must not assume a wake-up is coming.
             let status = unsafe { notify(self.queue) };
             if status != 0 {
-                return Err(NativeError { stage: "RIONotify", code: status });
+                return Err(NativeError {
+                    stage: if status == 10_037 {
+                        "RIONotify duplicate arm"
+                    } else {
+                        "RIONotify"
+                    },
+                    code: status,
+                });
             }
             self.armed = true;
             Ok(())
@@ -778,31 +976,45 @@ pub mod rio {
 
         /// Drains up to `results.len()` completions. RIO_CORRUPT_CQ is reported as a hard
         /// failure instead of being mistaken for "no work".
-        pub fn dequeue(&mut self, rio: &RioFunctions, results: &mut [RIORESULT]) -> Result<u32, NativeError> {
-            let dequeue = rio
-                .table()
-                .RIODequeueCompletion
-                .ok_or(NativeError { stage: "RIODequeueCompletion entry point", code: 13 })?;
-            let capacity = u32::try_from(results.len())
-                .map_err(|_| NativeError { stage: "RIODequeueCompletion capacity", code: 13 })?;
+        pub fn dequeue(
+            &mut self,
+            rio: &RioFunctions,
+            results: &mut [RIORESULT],
+        ) -> Result<u32, NativeError> {
+            let dequeue = rio.table().RIODequeueCompletion.ok_or(NativeError {
+                stage: "RIODequeueCompletion entry point",
+                code: 13,
+            })?;
+            let capacity = u32::try_from(results.len()).map_err(|_| NativeError {
+                stage: "RIODequeueCompletion capacity",
+                code: 13,
+            })?;
             // The array size is independent of the queue size: RIO returns at most as many
             // entries as there are completions, and the baseline always passes its full batch
             // buffer even when /cq reserved fewer entries than that.
             if capacity == 0 {
-                return Err(NativeError { stage: "RIODequeueCompletion capacity", code: 13 });
+                return Err(NativeError {
+                    stage: "RIODequeueCompletion capacity",
+                    code: 13,
+                });
             }
             let count = unsafe { dequeue(self.queue, results.as_mut_ptr(), capacity) };
             if count == u32::MAX {
-                return Err(NativeError { stage: "RIODequeueCompletion(RIO_CORRUPT_CQ)", code: 13 });
+                return Err(NativeError {
+                    stage: "RIODequeueCompletion(RIO_CORRUPT_CQ)",
+                    code: 13,
+                });
             }
             if count > capacity {
-                return Err(NativeError { stage: "RIODequeueCompletion count", code: 13 });
+                return Err(NativeError {
+                    stage: "RIODequeueCompletion count",
+                    code: 13,
+                });
             }
             Ok(count)
         }
 
-        /// Closes the queue through the table. The owner calls this after every worker thread
-        /// has joined, so no completion can be lost by closing early.
+        /// Closes the queue through the table after the owning loop has fully drained.
         pub fn close(&mut self, rio: &RioFunctions) {
             if self.queue.is_null() {
                 return;
@@ -817,9 +1029,8 @@ pub mod rio {
 
     impl Drop for CompletionQueue {
         fn drop(&mut self) {
-            // Closing happens through `close`, which has the extension table; dropping only
-            // forgets the handle so a partially initialised engine cannot double close.
-            self.queue = ptr::null_mut();
+            let rio = self.rio;
+            self.close(&rio);
         }
     }
     /// A registered memory region. RIO requires every buffer to be registered before it can
@@ -827,24 +1038,34 @@ pub mod rio {
     pub struct RegisteredBuffer {
         id: RIO_BUFFERID,
         length: u32,
+        rio: RioFunctions,
     }
 
     impl RegisteredBuffer {
         pub fn register(rio: &RioFunctions, bytes: &mut [u8]) -> Result<Self, NativeError> {
-            let register = rio
-                .table()
-                .RIORegisterBuffer
-                .ok_or(NativeError { stage: "RIORegisterBuffer entry point", code: 13 })?;
-            let length = u32::try_from(bytes.len())
-                .map_err(|_| NativeError { stage: "RIORegisterBuffer length", code: 13 })?;
+            let register = rio.table().RIORegisterBuffer.ok_or(NativeError {
+                stage: "RIORegisterBuffer entry point",
+                code: 13,
+            })?;
+            let length = u32::try_from(bytes.len()).map_err(|_| NativeError {
+                stage: "RIORegisterBuffer length",
+                code: 13,
+            })?;
             if length == 0 {
-                return Err(NativeError { stage: "RIORegisterBuffer length", code: 13 });
+                return Err(NativeError {
+                    stage: "RIORegisterBuffer length",
+                    code: 13,
+                });
             }
             let id = unsafe { register(bytes.as_mut_ptr() as *mut i8, length) };
-            if id.is_null() {
-                return Err(NativeError::last("RIORegisterBuffer"));
+            if id == RIO_INVALID_BUFFERID || id.is_null() {
+                return Err(NativeError::winsock("RIORegisterBuffer"));
             }
-            Ok(Self { id, length })
+            Ok(Self {
+                id,
+                length,
+                rio: *rio,
+            })
         }
 
         pub fn raw(&self) -> RIO_BUFFERID {
@@ -859,15 +1080,22 @@ pub mod rio {
         /// the engine can never hand RIO an out-of-range view.
         pub fn slice(&self, offset: u32, length: u32) -> Result<RIO_BUF, NativeError> {
             if length == 0 || offset > self.length || length > self.length - offset {
-                return Err(NativeError { stage: "RIO_BUF slice bounds", code: 13 });
+                return Err(NativeError {
+                    stage: "RIO_BUF slice bounds",
+                    code: 13,
+                });
             }
-            Ok(RIO_BUF { BufferId: self.id, Offset: offset, Length: length })
+            Ok(RIO_BUF {
+                BufferId: self.id,
+                Offset: offset,
+                Length: length,
+            })
         }
 
         /// Deregisters the region through the table. The owner calls this after every posted
         /// request has completed.
         pub fn deregister(&mut self, rio: &RioFunctions) {
-            if self.id.is_null() {
+            if self.id.is_null() || self.id == RIO_INVALID_BUFFERID {
                 return;
             }
             if let Some(deregister) = rio.table().RIODeregisterBuffer {
@@ -875,6 +1103,17 @@ pub mod rio {
             }
             self.id = ptr::null_mut();
             self.length = 0;
+        }
+
+        pub fn close(&mut self) {
+            let rio = self.rio;
+            self.deregister(&rio);
+        }
+    }
+
+    impl Drop for RegisteredBuffer {
+        fn drop(&mut self) {
+            self.close();
         }
     }
 
@@ -897,10 +1136,10 @@ pub mod rio {
             send_queue: RIO_CQ,
             socket_context: *mut c_void,
         ) -> Result<Self, NativeError> {
-            let create = rio
-                .table()
-                .RIOCreateRequestQueue
-                .ok_or(NativeError { stage: "RIOCreateRequestQueue entry point", code: 13 })?;
+            let create = rio.table().RIOCreateRequestQueue.ok_or(NativeError {
+                stage: "RIOCreateRequestQueue entry point",
+                code: 13,
+            })?;
             let queue = unsafe {
                 create(
                     socket,
@@ -914,7 +1153,7 @@ pub mod rio {
                 )
             };
             if queue.is_null() {
-                return Err(NativeError::last("RIOCreateRequestQueue"));
+                return Err(NativeError::winsock("RIOCreateRequestQueue"));
             }
             Ok(Self { queue })
         }
@@ -924,31 +1163,37 @@ pub mod rio {
         }
 
         /// Posts a receive. `request_context` is what comes back in the RIORESULT.
-        pub fn receive(&self, rio: &RioFunctions, buffer: &mut RIO_BUF, request_context: *const c_void)
-            -> Result<(), NativeError>
-        {
-            let receive = rio
-                .table()
-                .RIOReceive
-                .ok_or(NativeError { stage: "RIOReceive entry point", code: 13 })?;
+        pub fn receive(
+            &self,
+            rio: &RioFunctions,
+            buffer: &mut RIO_BUF,
+            request_context: *const c_void,
+        ) -> Result<(), NativeError> {
+            let receive = rio.table().RIOReceive.ok_or(NativeError {
+                stage: "RIOReceive entry point",
+                code: 13,
+            })?;
             let ok = unsafe { receive(self.queue, buffer, 1, 0, request_context) };
             if !ok.as_bool() {
-                return Err(NativeError::last("RIOReceive"));
+                return Err(NativeError::winsock("RIOReceive"));
             }
             Ok(())
         }
 
         /// Posts a send of one buffer.
-        pub fn send(&self, rio: &RioFunctions, buffer: &mut RIO_BUF, request_context: *const c_void)
-            -> Result<(), NativeError>
-        {
-            let send = rio
-                .table()
-                .RIOSend
-                .ok_or(NativeError { stage: "RIOSend entry point", code: 13 })?;
+        pub fn send(
+            &self,
+            rio: &RioFunctions,
+            buffer: &mut RIO_BUF,
+            request_context: *const c_void,
+        ) -> Result<(), NativeError> {
+            let send = rio.table().RIOSend.ok_or(NativeError {
+                stage: "RIOSend entry point",
+                code: 13,
+            })?;
             let ok = unsafe { send(self.queue, buffer, 1, 0, request_context) };
             if !ok.as_bool() {
-                return Err(NativeError::last("RIOSend"));
+                return Err(NativeError::winsock("RIOSend"));
             }
             Ok(())
         }
@@ -962,15 +1207,25 @@ pub mod rio {
             remote_address: &mut RIO_BUF,
             request_context: *const c_void,
         ) -> Result<(), NativeError> {
-            let receive = rio
-                .table()
-                .RIOReceiveEx
-                .ok_or(NativeError { stage: "RIOReceiveEx entry point", code: 13 })?;
+            let receive = rio.table().RIOReceiveEx.ok_or(NativeError {
+                stage: "RIOReceiveEx entry point",
+                code: 13,
+            })?;
             let status = unsafe {
-                receive(self.queue, buffer, 1, ptr::null_mut(), remote_address, ptr::null_mut(), ptr::null_mut(), 0, request_context)
+                receive(
+                    self.queue,
+                    buffer,
+                    1,
+                    ptr::null_mut(),
+                    remote_address,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    0,
+                    request_context,
+                )
             };
             if status == 0 {
-                return Err(NativeError::last("RIOReceiveEx"));
+                return Err(NativeError::winsock("RIOReceiveEx"));
             }
             Ok(())
         }
@@ -983,15 +1238,25 @@ pub mod rio {
             remote_address: &mut RIO_BUF,
             request_context: *const c_void,
         ) -> Result<(), NativeError> {
-            let send = rio
-                .table()
-                .RIOSendEx
-                .ok_or(NativeError { stage: "RIOSendEx entry point", code: 13 })?;
+            let send = rio.table().RIOSendEx.ok_or(NativeError {
+                stage: "RIOSendEx entry point",
+                code: 13,
+            })?;
             let ok = unsafe {
-                send(self.queue, buffer, 1, ptr::null_mut(), remote_address, ptr::null_mut(), ptr::null_mut(), 0, request_context)
+                send(
+                    self.queue,
+                    buffer,
+                    1,
+                    ptr::null_mut(),
+                    remote_address,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    0,
+                    request_context,
+                )
             };
             if !ok.as_bool() {
-                return Err(NativeError::last("RIOSendEx"));
+                return Err(NativeError::winsock("RIOSendEx"));
             }
             Ok(())
         }
@@ -999,7 +1264,12 @@ pub mod rio {
 
     /// Zeroed result slot: RIO writes every field of each dequeued entry.
     pub fn empty_result() -> RIORESULT {
-        RIORESULT { Status: 0, BytesTransferred: 0, SocketContext: 0, RequestContext: 0 }
+        RIORESULT {
+            Status: 0,
+            BytesTransferred: 0,
+            SocketContext: 0,
+            RequestContext: 0,
+        }
     }
 
     /// One packet from an IOCP queue.
@@ -1014,10 +1284,7 @@ pub mod rio {
     /// Blocks for up to `wait_milliseconds` for a packet. A timeout reports `succeeded == false`,
     /// `error == WAIT_TIMEOUT` and a null OVERLAPPED, which is how the baseline tells a timeout
     /// apart from a port failure.
-    pub fn get_queued_completion_status(
-        port: HANDLE,
-        wait_milliseconds: u32,
-    ) -> CompletionPacket {
+    pub fn get_queued_completion_status(port: HANDLE, wait_milliseconds: u32) -> CompletionPacket {
         let mut transferred: u32 = 0;
         // ULONG_PTR is u64 on x64; the packet reports it as usize, which is the same width.
         let mut key: u64 = 0;
@@ -1037,7 +1304,13 @@ pub mod rio {
         } else {
             unsafe { windows::Win32::errhandlingapi::GetLastError() }
         };
-        CompletionPacket { succeeded: ok, transferred, key: key as usize, overlapped, error }
+        CompletionPacket {
+            succeeded: ok,
+            transferred,
+            key: key as usize,
+            overlapped,
+            error,
+        }
     }
 
     /// Posts a control packet to a port the caller does not own: the acceptor hands a socket to
@@ -1052,12 +1325,128 @@ pub mod rio {
                 port,
                 0,
                 key,
-                if overlapped.is_null() { None } else { Some(overlapped) },
+                if overlapped.is_null() {
+                    None
+                } else {
+                    Some(overlapped)
+                },
             )
         };
         if !posted.as_bool() {
             return Err(NativeError::last("PostQueuedCompletionStatus"));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+        use windows::Win32::mswsock::RIO_EXTENSION_FUNCTION_TABLE;
+
+        static DEREGISTRATIONS: AtomicU32 = AtomicU32::new(0);
+        static QUEUE_CLOSES: AtomicU32 = AtomicU32::new(0);
+        static DEREGISTERED_ID: AtomicUsize = AtomicUsize::new(0);
+        static CLOSED_QUEUE: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "system" fn register_failure(_: *mut i8, _: u32) -> RIO_BUFFERID {
+            unsafe {
+                windows::Win32::winsock2::WSASetLastError(10_022);
+            }
+            RIO_INVALID_BUFFERID
+        }
+
+        unsafe extern "system" fn register_success(_: *mut i8, _: u32) -> RIO_BUFFERID {
+            1usize as RIO_BUFFERID
+        }
+
+        unsafe extern "system" fn deregister(id: RIO_BUFFERID) {
+            DEREGISTERED_ID.store(id as usize, Ordering::Relaxed);
+            DEREGISTRATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        unsafe extern "system" fn close_queue(queue: RIO_CQ) {
+            CLOSED_QUEUE.store(queue as usize, Ordering::Relaxed);
+            QUEUE_CLOSES.fetch_add(1, Ordering::Relaxed);
+        }
+
+        #[test]
+        fn invalid_registration_sentinel_reports_the_original_winsock_error() {
+            let rio = RioFunctions {
+                table: RIO_EXTENSION_FUNCTION_TABLE {
+                    RIORegisterBuffer: Some(register_failure),
+                    ..RIO_EXTENSION_FUNCTION_TABLE::default()
+                },
+            };
+            let mut memory = [0u8; 8];
+            let error = match RegisteredBuffer::register(&rio, &mut memory) {
+                Ok(_) => panic!("invalid RIO buffer id must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, 10_022);
+            assert_eq!(RIO_INVALID_BUFFERID as usize, 0x0000_0000_ffff_ffff);
+        }
+
+        #[test]
+        fn registered_buffer_drop_deregisters_once_even_after_explicit_close() {
+            DEREGISTRATIONS.store(0, Ordering::Relaxed);
+            let rio = RioFunctions {
+                table: RIO_EXTENSION_FUNCTION_TABLE {
+                    RIORegisterBuffer: Some(register_success),
+                    RIODeregisterBuffer: Some(deregister),
+                    ..RIO_EXTENSION_FUNCTION_TABLE::default()
+                },
+            };
+            let mut memory = [0u8; 8];
+            let mut registration = RegisteredBuffer::register(&rio, &mut memory).unwrap();
+            registration.deregister(&rio);
+            drop(registration);
+            assert_eq!(DEREGISTRATIONS.load(Ordering::Relaxed), 1);
+            drop(RegisteredBuffer::register(&rio, &mut memory).unwrap());
+            assert_eq!(DEREGISTRATIONS.load(Ordering::Relaxed), 2);
+            assert_eq!(DEREGISTERED_ID.load(Ordering::Relaxed), 1);
+        }
+
+        #[test]
+        fn completion_queue_drop_closes_once_even_after_explicit_close() {
+            QUEUE_CLOSES.store(0, Ordering::Relaxed);
+            let rio = RioFunctions {
+                table: RIO_EXTENSION_FUNCTION_TABLE {
+                    RIOCloseCompletionQueue: Some(close_queue),
+                    ..RIO_EXTENSION_FUNCTION_TABLE::default()
+                },
+            };
+            let mut queue = CompletionQueue {
+                queue: 2usize as RIO_CQ,
+                capacity: 64,
+                armed: false,
+                rio,
+            };
+            queue.close(&rio);
+            drop(queue);
+            assert_eq!(QUEUE_CLOSES.load(Ordering::Relaxed), 1);
+            drop(CompletionQueue {
+                queue: 2usize as RIO_CQ,
+                capacity: 64,
+                armed: false,
+                rio,
+            });
+            assert_eq!(QUEUE_CLOSES.load(Ordering::Relaxed), 2);
+            assert_eq!(CLOSED_QUEUE.load(Ordering::Relaxed), 2);
+        }
+
+        #[test]
+        fn rio_structures_match_the_windows_x64_abi() {
+            use core::mem::{offset_of, size_of};
+            assert_eq!(size_of::<RIO_BUF>(), 16);
+            assert_eq!(offset_of!(RIO_BUF, Offset), 8);
+            assert_eq!(size_of::<RIORESULT>(), 24);
+            assert_eq!(offset_of!(RIORESULT, RequestContext), 16);
+            assert_eq!(size_of::<RIO_NOTIFICATION_COMPLETION>(), 32);
+            assert_eq!(offset_of!(RIO_NOTIFICATION_COMPLETION, Anonymous), 8);
+            assert_eq!(size_of::<RIO_EXTENSION_FUNCTION_TABLE>(), 112);
+            assert_eq!(offset_of!(RIO_EXTENSION_FUNCTION_TABLE, RIONotify), 80);
+            assert_eq!(size_of::<windows::Win32::minwinbase::OVERLAPPED>(), 32);
+        }
     }
 }

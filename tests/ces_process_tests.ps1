@@ -60,12 +60,19 @@ function Invoke-Server {
 # --- command-line contract -------------------------------------------------------------
 $usage = Invoke-Server @()
 if ($usage.Code -ne 1) { throw "no arguments must be a usage error, got $($usage.Code)" }
-if ($usage.Err -notmatch 'Invalid arguments') { throw "usage error text missing: $($usage.Err)" }
-if ($usage.Out -notmatch 'Usage: rust-echo-server /p tcp\|udp') { throw "usage header missing: $($usage.Out)" }
+if ($usage.Out.Length -ne 0) { throw "usage errors must leave stdout empty: $($usage.Out)" }
+if ($usage.Err -notmatch '^Invalid arguments: missing-protocol\r?\n') { throw "usage error text missing: $($usage.Err)" }
+if ($usage.Err -notmatch 'Usage: rust-echo-server /p tcp\|udp') { throw "usage header missing: $($usage.Err)" }
 
-$help = Invoke-Server @('/help')
-if ($help.Code -ne 0) { throw "/help must succeed, got $($help.Code)" }
-if ($help.Out -notmatch 'Data I/O is always RIO') { throw "help text missing: $($help.Out)" }
+foreach ($helpSwitch in @('/h', '/help')) {
+    $help = Invoke-Server @($helpSwitch)
+    if ($help.Code -ne 0) { throw "$helpSwitch must succeed, got $($help.Code)" }
+    if ($help.Err.Length -ne 0) { throw "help must leave stderr empty: $($help.Err)" }
+    if ($help.Out -notmatch '^Usage: rust-echo-server /p tcp\|udp' -or
+        $help.Out -notmatch '\[/cq capacity\] \[/memory bytes\] \[/q\] \[/stats\] \[/h\]' -or
+        $help.Out -notmatch '/threads 0: automatic TCP workers' -or
+        $help.Out -notmatch '/w 0: no run limit\.') { throw "help text missing: $($help.Out)" }
+}
 
 foreach ($invalid in @(@('/p', 'tcp', '/k', '8'), @('/p', 'udp', '/t', '5'), @('/p', 'sctp'), @('/p', 'tcp', '/nope'), @('/p', 'udp', '/rio-buffer', '65000'))) {
     $result = Invoke-Server $invalid
@@ -76,9 +83,9 @@ foreach ($invalid in @(@('/p', 'tcp', '/k', '8'), @('/p', 'udp', '/t', '5'), @('
 # switch letter is a positional argument, and a wide value is not a number. Both are usage
 # errors (exit 1), never a panic while decoding the command line.
 $wideSwitch = Invoke-Server @('/p', 'tcp', '/端口', '7000')
-if ($wideSwitch.Code -ne 1 -or $wideSwitch.Err -notmatch 'positional arguments') { throw "a wide switch must be a positional-argument error, got $($wideSwitch.Code): $($wideSwitch.Err)" }
+if ($wideSwitch.Code -ne 1 -or $wideSwitch.Out.Length -ne 0 -or $wideSwitch.Err -notmatch '^Invalid arguments: unexpected-target\r?\n') { throw "a wide switch must be a positional-argument error, got $($wideSwitch.Code): $($wideSwitch.Err)" }
 $wideValue = Invoke-Server @('/p', 'tcp', '/s', '端口')
-if ($wideValue.Code -ne 1 -or $wideValue.Err -notmatch 'numeric switch') { throw "a wide value must be an invalid number, got $($wideValue.Code): $($wideValue.Err)" }
+if ($wideValue.Code -ne 1 -or $wideValue.Out.Length -ne 0 -or $wideValue.Err -notmatch '^Invalid arguments: invalid-number\r?\n') { throw "a wide value must be an invalid number, got $($wideValue.Code): $($wideValue.Err)" }
 Write-Host 'PASS server command-line contract'
 # --- TCP echo, statistics and a clean stop ---------------------------------------------
 $tcpPort = Get-FreeTcpPort
@@ -108,7 +115,7 @@ try {
     $tcp.WaitForExit(7000) | Out-Null
     if (-not $tcp.HasExited -or $tcp.ExitCode -ne 0) { throw 'TCP server did not stop cleanly' }
     $tcpText = Get-Content -LiteralPath $tcpOutput -Raw
-    if ($tcpText -notmatch 'final protocol=tcp .*accepted=[1-9][0-9]* .*bytes=[1-9][0-9]* .*active=0') {
+    if ($tcpText -notmatch '(?m)^final protocol=tcp (?=.*\baccepted=[1-9][0-9]*\b)(?=.*\bbytes=[1-9][0-9]*\b)(?=.*\bactive=0\b)') {
         throw "TCP final statistics are missing or incomplete: $tcpText"
     }
 } finally {
@@ -218,7 +225,7 @@ try {
     $udp.WaitForExit(7000) | Out-Null
     if (-not $udp.HasExited -or $udp.ExitCode -ne 0) { throw 'UDP server did not stop cleanly' }
     $udpText = Get-Content -LiteralPath $udpOutput -Raw
-    if ($udpText -notmatch 'final protocol=udp .*completions=[1-9][0-9]* .*receives=[1-9][0-9]* .*sends=3 .*bytes=65508 .*outstanding=0') {
+    if ($udpText -notmatch '(?m)^final protocol=udp (?=.*\bcompletions=[1-9][0-9]*\b)(?=.*\breceives=[1-9][0-9]*\b)(?=.*\bsends=3\b)(?=.*\bbytes=65508\b)(?=.*\boutstanding=0\b)') {
         throw "UDP final statistics are missing or incomplete: $udpText"
     }
 } finally {
@@ -572,12 +579,12 @@ try {
     if ($burstText -notmatch 'final protocol=tcp .* active=0') { throw "TCP burst final line missing: $burstText" }
     Write-Host "PASS server stops on Ctrl+Break under a TCP echo burst ($($burstWatch.ElapsedMilliseconds) ms, active=0)"
 } finally {
-    if ($null -ne $floodJob) {
-        Stop-Job -Job $floodJob -ErrorAction SilentlyContinue
-        Remove-Job -Job $floodJob -Force -ErrorAction SilentlyContinue
+    foreach ($job in $burstJobs) {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
     }
-    [CesConsoleLauncher]::Release($floodId)
-    Remove-Item -LiteralPath $floodOutput, $floodError -Force -ErrorAction SilentlyContinue
+    [CesConsoleLauncher]::Release($burstId)
+    Remove-Item -LiteralPath $burstOutput, $burstError -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host 'PASS server TCP/UDP loopback and stop-under-load scenarios'

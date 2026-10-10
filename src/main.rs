@@ -2,10 +2,11 @@ use std::process::ExitCode as ProcessExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use ces::contract::parse;
-use ces::native::{report, NativeError};
+use ces::contract::parse_wide;
+use ces::native::{NativeError, report};
 use ces::server::run_server;
 use ces::types::{ExitCode, Options, Protocol};
+use std::os::windows::ffi::OsStrExt;
 
 /// The console handler observes this flag; the engine polls it while draining, so a
 /// saturated server still stops promptly.
@@ -44,8 +45,9 @@ fn run(options: &Options) -> ExitCode {
             let control = Arc::new(AtomicBool::new(false));
             // Only one server runs per process, so the first registration wins.
             let _ = CONTROL.set(Arc::clone(&control));
-            let registered =
-                unsafe { windows::Win32::consoleapi::SetConsoleCtrlHandler(Some(console_handler), true) };
+            let registered = unsafe {
+                windows::Win32::consoleapi::SetConsoleCtrlHandler(Some(console_handler), true)
+            };
             if !registered.as_bool() {
                 let error = NativeError::last("SetConsoleCtrlHandler");
                 report(error.stage, error.code);
@@ -54,7 +56,8 @@ fn run(options: &Options) -> ExitCode {
             let result = run_server(options, &control);
             // Removal cannot fail for a handler that was just registered.
             unsafe {
-                let _ = windows::Win32::consoleapi::SetConsoleCtrlHandler(Some(console_handler), false);
+                let _ =
+                    windows::Win32::consoleapi::SetConsoleCtrlHandler(Some(console_handler), false);
             }
             result
         }
@@ -62,12 +65,12 @@ fn run(options: &Options) -> ExitCode {
 }
 
 fn main() -> ProcessExitCode {
-    // args_os plus a lossy conversion keeps an argument the platform cannot decode from
-    // panicking the process: the wide-argv baselines treat it as an ordinary token.
-    let arguments: Vec<String> = std::env::args_os()
-        .map(|value| value.to_string_lossy().into_owned())
+    // Preserve Windows UTF-16 so malformed surrogates produce the baseline's usage
+    // diagnostic instead of being silently replaced or panicking during UTF-8 decoding.
+    let arguments: Vec<Vec<u16>> = std::env::args_os()
+        .map(|value| value.encode_wide().collect())
         .collect();
-    let options = match parse(&arguments) {
+    let options = match parse_wide(&arguments) {
         Ok(options) => options,
         Err(error) => {
             eprintln!("Invalid arguments: {}", error.0);
@@ -81,5 +84,3 @@ fn main() -> ProcessExitCode {
     }
     ProcessExitCode::from(run(&options) as u8)
 }
-
-

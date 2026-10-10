@@ -1,11 +1,11 @@
-//! Windows x64 RIO echo server core.
+//! Windows x64 MSVC RIO echo server core.
 //!
-//! The module tree mirrors the C++ baseline file for file:
-//! contract -> native (Winsock/RIO/AcceptEx) -> engine (sessions and run) -> internal
-//! (accept table, connections, datagram slots, worker threads) -> server -> main.
-//! The internal module names are re-exported so the historical paths keep working.
+//! `server` loads Winsock/RIO and dispatches the protocol; `engine` is the native-free
+//! TCP worker state machine. `internal` contains accept/connection/UDP state and native
+//! worker runtimes, backed by `native` resource owners. Its public state modules are
+//! re-exported so the historical paths keep working.
 
-#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")))]
 compile_error!("ces targets Windows x64 (x86_64-pc-windows-msvc) only");
 
 pub mod contract;

@@ -39,18 +39,14 @@ pub const COMPLETION_BATCH_SIZE: usize = 256;
 /// A saturated peer can keep a completion queue non-empty indefinitely, so a drain
 /// yields to the control path after this many batches.
 pub const COMPLETION_DRAIN_BATCHES: u32 = 64;
-/// AcceptEx operations per worker thread.
-pub const ACCEPTS_PER_WORKER: u32 = 32;
-/// Upper bound on pre-posted AcceptEx operations, whatever the worker count.
-pub const MAXIMUM_ACCEPTS: u32 = 1_024;
 /// AcceptEx requires a SOCKADDR_STORAGE (128 bytes) plus 16 bytes of padding per address.
 pub const SOCKADDR_STORAGE_BYTES: usize = 128;
 pub const ACCEPT_ADDRESS_BYTES: usize = SOCKADDR_STORAGE_BYTES + 16;
 pub const ACCEPT_OPERATION_BYTES: usize = ACCEPT_ADDRESS_BYTES * 2;
 pub const UDP_ADDRESS_BYTES: usize = SOCKADDR_STORAGE_BYTES + 16;
-/// Worker-count bounds: /threads accepts 1..=64 and the automatic count is capped at 32.
+/// /threads accepts 0..=64; zero uses the active processor count capped at 64.
 pub const MAXIMUM_WORKERS: u32 = 64;
-pub const AUTOMATIC_WORKER_CAP: u32 = 32;
+pub const AUTOMATIC_WORKER_CAP: u32 = MAXIMUM_WORKERS;
 
 /// IOCP completion keys that are not accept operations. An accept operation is
 /// identified by its own address, which is always larger than both control keys.
@@ -65,6 +61,7 @@ pub const ERROR_NETNAME_DELETED: u32 = 64;
 pub const ERROR_IO_PENDING: i32 = 997;
 pub const ERROR_IO_INCOMPLETE: i32 = 996;
 pub const WSAECONNRESET: i32 = 10_054;
+pub const WSAECONNABORTED: i32 = 10_053;
 pub const WAIT_OBJECT_0: u32 = 0;
 pub const WAIT_TIMEOUT: u32 = 258;
 /// winbase.h INFINITE, passed to GetQueuedCompletionStatus.
@@ -141,15 +138,19 @@ pub struct WorkerLifecycle {
     pub phase: WorkerPhase,
     pub active_connections: u32,
     pub pending_handoffs: u32,
+    /// RIO requests must retire before the completion queue can be closed; a pending
+    /// notification delivery does not hold the worker open once this reaches zero.
+    pub rio_outstanding: u32,
     pub notification_armed: bool,
 }
 
 /// A worker may only be released once admission is closed and every accepted socket
-/// and pending handoff has been drained.
+/// and pending handoff has been drained and every RIO request has retired.
 pub fn worker_may_exit(lifecycle: &WorkerLifecycle) -> bool {
     lifecycle.phase >= WorkerPhase::AdmissionClosed
         && lifecycle.active_connections == 0
         && lifecycle.pending_handoffs == 0
+        && lifecycle.rio_outstanding == 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -179,16 +180,49 @@ pub struct Statistics {
     pub completions: u64,
     pub receives: u64,
     pub sends: u64,
-    /// Every byte the socket delivered, which is not the same total as `bytes`: `bytes` counts
-    /// only echoes that were verified against the payload.
+    /// Bytes reported by successful native receive completions.
     pub received_bytes: u64,
-    /// Every byte handed to the socket, whether or not its echo came back.
+    /// Bytes reported by successful native send completions.
     pub sent_bytes: u64,
     pub bytes: u64,
     /// Failures at the connection or accept layer, and the connects refused for capacity. The
     /// reference keeps them apart from the protocol counters for exactly that reason.
     pub network_errors: u64,
     pub rejected: u64,
+}
+
+/// Optional notification observability, copied only once the owning loop has stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NotifySnapshot {
+    pub worker: u32,
+    pub arms: u64,
+    pub deliveries: u64,
+    pub timeout_wakeups: u64,
+}
+
+impl NotifySnapshot {
+    pub fn valid(&self) -> bool {
+        self.timeout_wakeups == 0
+            && self.arms >= self.deliveries
+            && self.arms - self.deliveries <= 1
+    }
+
+    pub fn line(&self, protocol: Protocol) -> String {
+        let name = if protocol == Protocol::Udp {
+            "udp"
+        } else {
+            "tcp"
+        };
+        format!(
+            "role=server protocol={} worker={} notify_arms={} notify_deliveries={} notify_gap={} timeout_wakeups_while_outstanding={}\n",
+            name,
+            self.worker,
+            self.arms,
+            self.deliveries,
+            self.arms.saturating_sub(self.deliveries),
+            self.timeout_wakeups
+        )
+    }
 }
 
 impl Statistics {
@@ -204,14 +238,6 @@ impl Statistics {
         self.bytes = self.bytes.wrapping_add(other.bytes);
         self.network_errors = self.network_errors.wrapping_add(other.network_errors);
         self.rejected = self.rejected.wrapping_add(other.rejected);
-    }
-
-    /// One line per TCP worker, printed after that worker has joined.
-    pub fn worker_line(&self, worker_index: u32, active: u32) -> String {
-        format!(
-            "[worker {}] accepted={} completions={} receives={} sends={} bytes={} active={}",
-            worker_index, self.accepted, self.completions, self.receives, self.sends, self.bytes, active
-        )
     }
 
     /// The aggregate terminal line, in the reference's field order for both protocols: the only
@@ -270,6 +296,7 @@ mod tests {
             phase: WorkerPhase::Quiescing,
             active_connections: 0,
             pending_handoffs: 0,
+            rio_outstanding: 0,
             notification_armed: true,
         };
         assert!(!worker_may_exit(&lifecycle));
@@ -281,7 +308,11 @@ mod tests {
         lifecycle.active_connections = 1;
         assert!(!worker_may_exit(&lifecycle));
         lifecycle.active_connections = 0;
+        lifecycle.rio_outstanding = 1;
+        assert!(!worker_may_exit(&lifecycle));
         lifecycle.phase = WorkerPhase::Stopped;
+        assert!(!worker_may_exit(&lifecycle));
+        lifecycle.rio_outstanding = 0;
         assert!(worker_may_exit(&lifecycle));
     }
 
@@ -318,10 +349,6 @@ mod tests {
         assert_eq!(total.sends, 16);
         assert_eq!(total.bytes, 12_288);
         assert_eq!(
-            total.worker_line(1, 0),
-            "[worker 1] accepted=10 completions=30 receives=14 sends=16 bytes=12288 active=0"
-        );
-        assert_eq!(
             total.final_line(Protocol::Tcp, 500, 4, 0),
             "final protocol=tcp elapsed_ms=500 workers=4 accepted=10 active=0 outstanding=0 \
 completions=30 receives=14 sends=16 received_bytes=0 sent_bytes=0 bytes=12288 network_errors=0 rejected=0 \
@@ -336,11 +363,39 @@ MiB_per_sec=11.72"
         );
 
         // Large values wrap exactly instead of saturating, matching the C++ counters.
-        let mut large = Statistics { accepted: u64::MAX - 100, bytes: u64::MAX - 4096, ..Statistics::default() };
-        large.merge(&Statistics { accepted: 100, bytes: 4096, ..Statistics::default() });
+        let mut large = Statistics {
+            accepted: u64::MAX - 100,
+            bytes: u64::MAX - 4096,
+            ..Statistics::default()
+        };
+        large.merge(&Statistics {
+            accepted: 100,
+            bytes: 4096,
+            ..Statistics::default()
+        });
         assert_eq!(large.accepted, u64::MAX);
         assert_eq!(large.bytes, u64::MAX);
     }
+
+    #[test]
+    fn notification_snapshot_allows_only_one_pending_real_delivery() {
+        let mut snapshot = NotifySnapshot {
+            worker: 3,
+            arms: 7,
+            deliveries: 6,
+            timeout_wakeups: 0,
+        };
+        assert!(snapshot.valid());
+        assert_eq!(
+            snapshot.line(Protocol::Udp),
+            "role=server protocol=udp worker=3 notify_arms=7 notify_deliveries=6 notify_gap=1 timeout_wakeups_while_outstanding=0\n"
+        );
+        snapshot.deliveries = 5;
+        assert!(!snapshot.valid());
+        snapshot.deliveries = 8;
+        assert!(!snapshot.valid());
+        snapshot.deliveries = 7;
+        snapshot.timeout_wakeups = 1;
+        assert!(!snapshot.valid());
+    }
 }
-
-

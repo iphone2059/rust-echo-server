@@ -1,7 +1,7 @@
 //! Worker threads, their business state and the datagram runtime.
 //!
-//! This is the reference's cec_engine_internal.cpp: the accept table, the connection progression,
-//! the datagram slots and the timers that drive them. Native object lifetime stays in `engine`.
+//! This is the reference's ces_engine_internal.cpp: the accept table, connection progression,
+//! datagram slots, worker runtimes and timers. The pure TCP aggregate lives in `engine`.
 
 pub mod acceptor {
     //! Acceptor state machine: the AcceptEx operation table and the handoff policy.
@@ -11,12 +11,69 @@ pub mod acceptor {
     //! slot is posted again, so the operation table is a fixed-size resource that never grows
     //! and never hands the same socket to two workers.
 
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::borrow::Borrow;
 
     use windows::Win32::minwinbase::OVERLAPPED;
     use windows::Win32::winsock2::{INVALID_SOCKET, SOCKET};
 
-    use crate::types::{ACCEPT_OPERATION_BYTES, ERROR_INVALID_DATA, ERROR_NETNAME_DELETED};
+    use crate::types::{
+        ACCEPT_OPERATION_BYTES, ERROR_INVALID_DATA, ERROR_NETNAME_DELETED, WSAECONNABORTED,
+        WSAECONNRESET,
+    };
+
+    /// Includes reservations in transit, so the acceptor cannot overbook a worker before
+    /// that worker has consumed earlier handoff packets.
+    pub struct AdmissionCredits {
+        available: AtomicU32,
+        capacity: u32,
+    }
+
+    impl AdmissionCredits {
+        pub fn new(capacity: u32) -> Self {
+            Self {
+                available: AtomicU32::new(capacity),
+                capacity,
+            }
+        }
+
+        pub fn try_reserve(&self) -> bool {
+            self.available
+                .try_update(Ordering::Acquire, Ordering::Relaxed, |credit| {
+                    credit.checked_sub(1)
+                })
+                .is_ok()
+        }
+
+        pub fn release(&self) {
+            if self.available.fetch_add(1, Ordering::Release) >= self.capacity {
+                crate::native::fail_fast("worker admission credit", 5023);
+            }
+        }
+
+        pub fn is_full(&self) -> bool {
+            self.available.load(Ordering::Acquire) == self.capacity
+        }
+    }
+
+    pub fn select_worker<C: Borrow<AdmissionCredits>>(
+        credits: &[C],
+        next: &mut u32,
+    ) -> Option<u32> {
+        let count = u32::try_from(credits.len()).ok()?;
+        if count == 0 {
+            return None;
+        }
+        for offset in 0..count {
+            let index = (*next + offset) % count;
+            if credits[index as usize].borrow().try_reserve() {
+                *next = (index + 1) % count;
+                return Some(index);
+            }
+        }
+        None
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum AcceptState {
@@ -26,6 +83,8 @@ pub mod acceptor {
         Posted,
         /// The socket was handed to a worker and is waiting to be acknowledged.
         Transit,
+        /// Synchronous reset retries yielded to a queued repost control packet.
+        Deferred,
     }
 
     /// What the acceptor thread must do next.
@@ -42,11 +101,13 @@ pub mod acceptor {
     }
 
     /// A peer that resets before AcceptEx completes aborts that single incoming connection;
-    /// ERROR_NETNAME_DELETED is the documented outcome for it. Everything else keeps the
+    /// These three statuses abort only the incoming connection. Everything else keeps the
     /// baseline's fatal classification so real listener or IOCP damage stops admission instead
     /// of being retried forever.
     pub fn accept_error_is_recoverable(error: u32) -> bool {
         error == ERROR_NETNAME_DELETED
+            || error == WSAECONNRESET as u32
+            || error == WSAECONNABORTED as u32
     }
 
     pub struct AcceptorCore {
@@ -81,7 +142,10 @@ pub mod acceptor {
         }
 
         pub fn transiting(&self) -> u32 {
-            self.states.iter().filter(|state| **state == AcceptState::Transit).count() as u32
+            self.states
+                .iter()
+                .filter(|state| **state == AcceptState::Transit)
+                .count() as u32
         }
 
         /// Every slot that must be posted when the acceptor starts.
@@ -96,16 +160,37 @@ pub mod acceptor {
             }
         }
 
+        pub fn defer_repost(&mut self, index: u32) {
+            if let Some(state) = self.states.get_mut(index as usize) {
+                *state = AcceptState::Deferred;
+            }
+        }
+
+        pub fn reserve_worker<C: Borrow<AdmissionCredits>>(
+            &mut self,
+            candidate: u32,
+            credits: &[C],
+        ) -> Option<u32> {
+            self.next_worker = candidate;
+            select_worker(credits, &mut self.next_worker)
+        }
+
         /// An AcceptEx completion. `completed` is what GetQueuedCompletionStatus reported;
         /// `error` is the last error of the port when it failed.
         pub fn on_completion(&mut self, index: u32, completed: bool, error: u32) -> AcceptAction {
             let Some(state) = self.states.get_mut(index as usize) else {
-                return AcceptAction::Fatal { index, error: ERROR_INVALID_DATA as u32 };
+                return AcceptAction::Fatal {
+                    index,
+                    error: ERROR_INVALID_DATA as u32,
+                };
             };
             if *state != AcceptState::Posted {
                 // A completion for a slot that was never posted means the port is delivering
                 // packets this acceptor does not own.
-                return AcceptAction::Fatal { index, error: ERROR_INVALID_DATA as u32 };
+                return AcceptAction::Fatal {
+                    index,
+                    error: ERROR_INVALID_DATA as u32,
+                };
             }
             if !completed {
                 *state = AcceptState::Idle;
@@ -119,7 +204,10 @@ pub mod acceptor {
                 return AcceptAction::Fatal { index, error };
             }
             if self.worker_count == 0 {
-                return AcceptAction::Fatal { index, error: ERROR_INVALID_DATA as u32 };
+                return AcceptAction::Fatal {
+                    index,
+                    error: ERROR_INVALID_DATA as u32,
+                };
             }
             let worker = self.next_worker % self.worker_count;
             self.next_worker = self.next_worker.wrapping_add(1);
@@ -131,10 +219,16 @@ pub mod acceptor {
         /// the acceptor again and must be closed before the slot is reused.
         pub fn on_ack(&mut self, index: u32) -> AcceptAction {
             let Some(state) = self.states.get_mut(index as usize) else {
-                return AcceptAction::Fatal { index, error: ERROR_INVALID_DATA as u32 };
+                return AcceptAction::Fatal {
+                    index,
+                    error: ERROR_INVALID_DATA as u32,
+                };
             };
-            if *state != AcceptState::Transit {
-                return AcceptAction::Fatal { index, error: ERROR_INVALID_DATA as u32 };
+            if !matches!(*state, AcceptState::Transit | AcceptState::Deferred) {
+                return AcceptAction::Fatal {
+                    index,
+                    error: ERROR_INVALID_DATA as u32,
+                };
             }
             *state = AcceptState::Idle;
             if self.stopping {
@@ -164,14 +258,13 @@ pub mod acceptor {
         }
     }
 
-
     /// The native record AcceptEx completes into. The OVERLAPPED must stay first: the IOCP
     /// hands its address back and the acceptor recovers the record from that address alone.
     /// The socket field is atomic because ownership crosses threads: the acceptor posts it,
     /// a worker takes it with a single swap, and whoever still holds it closes it.
     #[repr(C)]
     pub struct AcceptOperation {
-        pub overlapped: OVERLAPPED,
+        pub overlapped: UnsafeCell<OVERLAPPED>,
         pub socket: AtomicUsize,
         pub index: u32,
         pub owner: usize,
@@ -185,15 +278,15 @@ pub mod acceptor {
     /// a worker left behind; the worker takes the socket it was handed.
     pub struct AcceptTable {
         operations: Box<[AcceptOperation]>,
-        addresses: Box<[u8]>,
+        addresses: Box<[UnsafeCell<[u8; ACCEPT_OPERATION_BYTES]>]>,
         identity: usize,
         port: crate::native::SendHandle,
     }
 
-    // SAFETY: the table's records are allocated once and never move or grow; the only field two
-    // threads touch concurrently is the atomic socket. Everything else is written by the
-    // acceptor thread before it publishes the slot through an IOCP packet, and the IOCP packet
-    // pair (handoff, acknowledgement) orders those writes with the worker's reads.
+    // SAFETY: records never move or grow. Metadata is immutable and socket transfers are
+    // atomic. Win32 writes only the UnsafeCell output regions while a slot is posted;
+    // the acceptor waits for completion before resetting or reusing those regions. The
+    // handoff/acknowledgement packet pair orders the socket ownership transfer.
     unsafe impl Send for AcceptTable {}
     unsafe impl Sync for AcceptTable {}
 
@@ -202,7 +295,7 @@ pub mod acceptor {
             let count = operation_count as usize;
             let mut operations: Box<[AcceptOperation]> = (0..operation_count)
                 .map(|index| AcceptOperation {
-                    overlapped: OVERLAPPED::default(),
+                    overlapped: UnsafeCell::new(OVERLAPPED::default()),
                     socket: AtomicUsize::new(INVALID_SOCKET),
                     index,
                     owner: 0,
@@ -212,8 +305,15 @@ pub mod acceptor {
             for operation in operations.iter_mut() {
                 operation.owner = identity;
             }
-            let addresses = vec![0u8; count * ACCEPT_OPERATION_BYTES].into_boxed_slice();
-            Self { operations, addresses, identity, port }
+            let addresses = (0..count)
+                .map(|_| UnsafeCell::new([0u8; ACCEPT_OPERATION_BYTES]))
+                .collect();
+            Self {
+                operations,
+                addresses,
+                identity,
+                port,
+            }
         }
 
         /// The acceptor's IOCP handle: the worker acknowledges a handoff by posting to it.
@@ -232,16 +332,15 @@ pub mod acceptor {
         /// The completion identity of a slot: the address AcceptEx was given.
         pub fn overlapped_ptr(&self, index: u32) -> *mut OVERLAPPED {
             match self.operations.get(index as usize) {
-                Some(operation) => &operation.overlapped as *const OVERLAPPED as *mut OVERLAPPED,
+                Some(operation) => operation.overlapped.get(),
                 None => core::ptr::null_mut(),
             }
         }
 
         /// The output buffer AcceptEx writes the two addresses into.
         pub fn address_ptr(&self, index: u32) -> *mut core::ffi::c_void {
-            let offset = index as usize * ACCEPT_OPERATION_BYTES;
-            match self.addresses.get(offset..offset + ACCEPT_OPERATION_BYTES) {
-                Some(_) => unsafe { self.addresses.as_ptr().add(offset) as *mut core::ffi::c_void },
+            match self.addresses.get(index as usize) {
+                Some(addresses) => addresses.get().cast(),
                 None => core::ptr::null_mut(),
             }
         }
@@ -270,7 +369,11 @@ pub mod acceptor {
         pub fn take_socket(&self, index: u32) -> Option<SOCKET> {
             let operation = self.operations.get(index as usize)?;
             let raw = operation.socket.swap(INVALID_SOCKET, Ordering::AcqRel);
-            if raw == INVALID_SOCKET { None } else { Some(raw) }
+            if raw == INVALID_SOCKET {
+                None
+            } else {
+                Some(raw)
+            }
         }
 
         /// Publishes the socket the acceptor just created for a posted operation.
@@ -285,7 +388,11 @@ pub mod acceptor {
         pub fn clear_socket(&self, index: u32) -> Option<SOCKET> {
             let operation = self.operations.get(index as usize)?;
             let raw = operation.socket.swap(INVALID_SOCKET, Ordering::AcqRel);
-            if raw == INVALID_SOCKET { None } else { Some(raw) }
+            if raw == INVALID_SOCKET {
+                None
+            } else {
+                Some(raw)
+            }
         }
     }
 
@@ -307,14 +414,32 @@ pub mod acceptor {
             for index in 0..2 {
                 core.mark_posted(index);
             }
-            assert_eq!(core.on_completion(0, true, 0), AcceptAction::Handoff { index: 0, worker: 0 });
+            assert_eq!(
+                core.on_completion(0, true, 0),
+                AcceptAction::Handoff {
+                    index: 0,
+                    worker: 0
+                }
+            );
             assert_eq!(core.state(0), Some(AcceptState::Transit));
             assert_eq!(core.transiting(), 1);
-            assert_eq!(core.on_completion(1, true, 0), AcceptAction::Handoff { index: 1, worker: 1 });
+            assert_eq!(
+                core.on_completion(1, true, 0),
+                AcceptAction::Handoff {
+                    index: 1,
+                    worker: 1
+                }
+            );
             // An acknowledged handoff is reposted and continues the rotation.
             assert_eq!(core.on_ack(0), AcceptAction::Repost { index: 0 });
             core.mark_posted(0);
-            assert_eq!(core.on_completion(0, true, 0), AcceptAction::Handoff { index: 0, worker: 2 });
+            assert_eq!(
+                core.on_completion(0, true, 0),
+                AcceptAction::Handoff {
+                    index: 0,
+                    worker: 2
+                }
+            );
             assert!(core.has_live());
         }
 
@@ -329,9 +454,79 @@ pub mod acceptor {
             assert_eq!(core.state(0), Some(AcceptState::Idle));
 
             core.mark_posted(0);
-            assert_eq!(core.on_completion(0, false, 87), AcceptAction::Fatal { index: 0, error: 87 });
+            assert_eq!(
+                core.on_completion(0, false, 87),
+                AcceptAction::Fatal {
+                    index: 0,
+                    error: 87
+                }
+            );
             assert!(!accept_error_is_recoverable(87));
             assert!(accept_error_is_recoverable(ERROR_NETNAME_DELETED));
+            assert!(accept_error_is_recoverable(10_054));
+            assert!(accept_error_is_recoverable(10_053));
+        }
+
+        #[test]
+        fn deferred_reposts_are_consumed_before_acceptor_shutdown() {
+            let mut core = AcceptorCore::new(1, 1);
+            core.defer_repost(0);
+            assert!(core.has_live());
+            core.stop();
+            assert_eq!(core.on_ack(0), AcceptAction::None);
+            assert!(!core.has_live());
+        }
+
+        #[test]
+        fn admission_skips_full_workers_and_restores_released_reservations() {
+            let credits = vec![AdmissionCredits::new(1), AdmissionCredits::new(2)];
+            let mut next = 0;
+            assert_eq!(select_worker(&credits, &mut next), Some(0));
+            assert_eq!(select_worker(&credits, &mut next), Some(1));
+            assert_eq!(select_worker(&credits, &mut next), Some(1));
+            assert_eq!(select_worker(&credits, &mut next), None);
+            credits[0].release();
+            assert_eq!(select_worker(&credits, &mut next), Some(0));
+            credits[0].release();
+            credits[1].release();
+            credits[1].release();
+            assert!(credits.iter().all(AdmissionCredits::is_full));
+        }
+
+        #[test]
+        fn concurrent_reservations_never_overbook_a_worker() {
+            let credit = std::sync::Arc::new(AdmissionCredits::new(7));
+            let joins: Vec<_> = (0..16)
+                .map(|_| {
+                    let credit = std::sync::Arc::clone(&credit);
+                    std::thread::spawn(move || credit.try_reserve())
+                })
+                .collect();
+            let reserved = joins
+                .into_iter()
+                .map(|join| join.join().unwrap())
+                .filter(|reserved| *reserved)
+                .count();
+            assert_eq!(reserved, 7);
+            for _ in 0..reserved {
+                credit.release();
+            }
+            assert!(credit.is_full());
+        }
+
+        #[test]
+        fn accept_table_validates_identity_before_reading_native_output() {
+            let table = AcceptTable::new(2, crate::native::SendHandle(core::ptr::null_mut()));
+            let address = table.overlapped_ptr(1) as usize;
+            assert_eq!(table.find(address).unwrap().index, 1);
+            assert!(table.find(address + 1).is_none());
+            assert!(table.find(0).is_none());
+            assert!(table.address_ptr(2).is_null());
+            // Native output uses UnsafeCell; immutable metadata remains safe to inspect.
+            unsafe {
+                (*table.overlapped_ptr(1)).Internal = 7;
+            }
+            assert_eq!(table.find(address).unwrap().index, 1);
         }
 
         #[test]
@@ -339,16 +534,25 @@ pub mod acceptor {
             let mut core = AcceptorCore::new(2, 1);
             assert_eq!(
                 core.on_completion(0, true, 0),
-                AcceptAction::Fatal { index: 0, error: ERROR_INVALID_DATA as u32 }
+                AcceptAction::Fatal {
+                    index: 0,
+                    error: ERROR_INVALID_DATA as u32
+                }
             );
             assert_eq!(
                 core.on_completion(9, true, 0),
-                AcceptAction::Fatal { index: 9, error: ERROR_INVALID_DATA as u32 }
+                AcceptAction::Fatal {
+                    index: 9,
+                    error: ERROR_INVALID_DATA as u32
+                }
             );
             // An acknowledgement without a handoff is refused too.
             assert_eq!(
                 core.on_ack(1),
-                AcceptAction::Fatal { index: 1, error: ERROR_INVALID_DATA as u32 }
+                AcceptAction::Fatal {
+                    index: 1,
+                    error: ERROR_INVALID_DATA as u32
+                }
             );
         }
 
@@ -356,7 +560,13 @@ pub mod acceptor {
         fn an_aborted_handoff_returns_the_slot_and_clears_the_live_count() {
             let mut core = AcceptorCore::new(2, 1);
             core.mark_posted(0);
-            assert_eq!(core.on_completion(0, true, 0), AcceptAction::Handoff { index: 0, worker: 0 });
+            assert_eq!(
+                core.on_completion(0, true, 0),
+                AcceptAction::Handoff {
+                    index: 0,
+                    worker: 0
+                }
+            );
             assert!(core.has_live());
             // The socket disappeared before the handoff completed: the slot must not stay in
             // transit waiting for an acknowledgement that cannot come.
@@ -373,13 +583,22 @@ pub mod acceptor {
             let mut core = AcceptorCore::new(2, 1);
             core.mark_posted(0);
             core.mark_posted(1);
-            assert_eq!(core.on_completion(0, true, 0), AcceptAction::Handoff { index: 0, worker: 0 });
+            assert_eq!(
+                core.on_completion(0, true, 0),
+                AcceptAction::Handoff {
+                    index: 0,
+                    worker: 0
+                }
+            );
             core.stop();
             assert!(core.has_live());
             assert_eq!(core.on_ack(0), AcceptAction::None);
             assert_eq!(core.state(0), Some(AcceptState::Idle));
             // A reset peer that completes after the stop is not reposted.
-            assert_eq!(core.on_completion(1, false, ERROR_NETNAME_DELETED), AcceptAction::None);
+            assert_eq!(
+                core.on_completion(1, false, ERROR_NETNAME_DELETED),
+                AcceptAction::None
+            );
             assert!(!core.has_live());
         }
     }
@@ -394,7 +613,7 @@ pub mod connection {
     //! `ces_engine_process_result` in the C++ baseline and `processResult` in the Swift port.
 
     use crate::contract::advance_offset_u32;
-    use crate::types::{EngineOperation, ERROR_SUCCESS};
+    use crate::types::{ERROR_SUCCESS, EngineOperation};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum ConnectionState {
@@ -415,7 +634,10 @@ pub mod connection {
     pub enum ConnectionStep {
         None,
         Receive,
-        Send { offset: u32, length: u32 },
+        Send {
+            offset: u32,
+            length: u32,
+        },
         /// Close the socket now. The slot is not reusable yet: the operations that were in
         /// flight still have to complete, and the peer must see the connection go away
         /// immediately (this is what makes an idle /t connection time out).
@@ -487,13 +709,20 @@ pub mod connection {
             now: u64,
             timeout_milliseconds: u64,
         ) -> ConnectionStep {
-            debug_assert!(self.outstanding > 0, "completion without a posted operation");
+            debug_assert!(
+                self.outstanding > 0,
+                "completion without a posted operation"
+            );
             self.outstanding = self.outstanding.saturating_sub(1);
             if self.state == ConnectionState::Closing {
                 // A socket closed with work in flight still has to be drained before the slot
                 // can be handed to a new connection. The socket is already closed, so the
                 // release simply closes it again (a no-op) and recycles the index.
-                return if self.outstanding == 0 { self.release() } else { ConnectionStep::None };
+                return if self.outstanding == 0 {
+                    self.release()
+                } else {
+                    ConnectionStep::None
+                };
             }
             if status != ERROR_SUCCESS {
                 return self.close();
@@ -508,7 +737,10 @@ pub mod connection {
                     self.send_offset = 0;
                     self.deadline = now + timeout_milliseconds;
                     self.state = ConnectionState::Sending;
-                    ConnectionStep::Send { offset: 0, length: bytes }
+                    ConnectionStep::Send {
+                        offset: 0,
+                        length: bytes,
+                    }
                 }
                 EngineOperation::Send => {
                     self.deadline = now + timeout_milliseconds;
@@ -540,7 +772,11 @@ pub mod connection {
             }
             self.state = ConnectionState::Closing;
             self.deadline = 0;
-            if self.outstanding == 0 { self.release() } else { ConnectionStep::Close }
+            if self.outstanding == 0 {
+                self.release()
+            } else {
+                ConnectionStep::Close
+            }
         }
 
         fn release(&mut self) -> ConnectionStep {
@@ -574,7 +810,10 @@ pub mod connection {
             connection.outstanding = 1;
             assert_eq!(
                 connection.on_completion(EngineOperation::Receive, 0, 1_024, 10, 5_000),
-                ConnectionStep::Send { offset: 0, length: 1_024 }
+                ConnectionStep::Send {
+                    offset: 0,
+                    length: 1_024
+                }
             );
             assert_eq!(connection.state, ConnectionState::Sending);
             assert_eq!(connection.echo_bytes, 1_024);
@@ -591,7 +830,10 @@ pub mod connection {
             connection.outstanding = 1;
             assert_eq!(
                 connection.on_completion(EngineOperation::Send, 0, 400, 0, 5_000),
-                ConnectionStep::Send { offset: 400, length: 600 }
+                ConnectionStep::Send {
+                    offset: 400,
+                    length: 600
+                }
             );
             connection.outstanding = 1;
             assert_eq!(
@@ -669,8 +911,8 @@ pub mod udp {
     //! unit-testable.
 
     use crate::types::{
-        udp_may_release, EngineOperation, Statistics, UdpPhase, ERROR_INVALID_DATA, ERROR_SUCCESS,
-        WSAECONNRESET,
+        ERROR_INVALID_DATA, ERROR_SUCCESS, EngineOperation, Statistics, UdpPhase, WSAECONNRESET,
+        udp_may_release,
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -747,10 +989,16 @@ pub mod udp {
         /// transferred byte count.
         pub fn on_completion(&mut self, index: u32, status: i32, bytes: u32) -> UdpAction {
             let Some(slot) = self.slots.get_mut(index as usize) else {
-                return UdpAction::Fatal { index, error: ERROR_INVALID_DATA };
+                return UdpAction::Fatal {
+                    index,
+                    error: ERROR_INVALID_DATA,
+                };
             };
             if !slot.outstanding || self.outstanding == 0 {
-                return UdpAction::Fatal { index, error: ERROR_INVALID_DATA };
+                return UdpAction::Fatal {
+                    index,
+                    error: ERROR_INVALID_DATA,
+                };
             }
             slot.outstanding = false;
             self.outstanding -= 1;
@@ -773,6 +1021,8 @@ pub mod udp {
                         self.statistics.bytes = self.statistics.bytes.wrapping_add(transferred);
                     }
                 }
+            } else if !self.closing {
+                self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
             }
             if self.closing {
                 return UdpAction::None;
@@ -787,7 +1037,10 @@ pub mod udp {
                     self.failed = true;
                     self.closing = true;
                     self.phase = UdpPhase::Draining;
-                    return UdpAction::Fatal { index, error: status };
+                    return UdpAction::Fatal {
+                        index,
+                        error: status,
+                    };
                 }
             } else if slot.operation == EngineOperation::Receive {
                 // Echo exactly what arrived, from the same slot.
@@ -804,6 +1057,7 @@ pub mod udp {
         /// The post for a slot was refused. The request never entered the queue, so the engine
         /// gives up on the socket and drains what is still in flight.
         pub fn on_post_failure(&mut self, index: u32) {
+            self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
             if let Some(slot) = self.slots.get_mut(index as usize) {
                 if slot.outstanding {
                     // Defensive: a post that was counted and then refused must not stay counted.
@@ -856,7 +1110,10 @@ pub mod udp {
             assert_eq!(engine.slot(0).unwrap().operation, EngineOperation::Receive);
             assert_eq!(engine.slot(0).unwrap().payload_length, 65_507);
 
-            assert_eq!(engine.on_completion(0, 0, 1_200), UdpAction::Post { index: 0 });
+            assert_eq!(
+                engine.on_completion(0, 0, 1_200),
+                UdpAction::Post { index: 0 }
+            );
             let slot = engine.slot(0).unwrap();
             assert_eq!(slot.operation, EngineOperation::Send);
             assert_eq!(slot.payload_length, 1_200);
@@ -866,7 +1123,10 @@ pub mod udp {
             engine.mark_posted(0);
 
             // The send completes; the slot returns to a full-capacity receive.
-            assert_eq!(engine.on_completion(0, 0, 1_200), UdpAction::Post { index: 0 });
+            assert_eq!(
+                engine.on_completion(0, 0, 1_200),
+                UdpAction::Post { index: 0 }
+            );
             let slot = engine.slot(0).unwrap();
             assert_eq!(slot.operation, EngineOperation::Receive);
             assert_eq!(slot.payload_length, 65_507);
@@ -911,7 +1171,10 @@ pub mod udp {
             let mut engine = started(2);
             assert_eq!(
                 engine.on_completion(0, 1_234, 0),
-                UdpAction::Fatal { index: 0, error: 1_234 }
+                UdpAction::Fatal {
+                    index: 0,
+                    error: 1_234
+                }
             );
             assert!(engine.failed);
             assert!(engine.closing);
@@ -937,18 +1200,21 @@ pub mod udp {
         fn unknown_or_duplicate_completions_are_refused() {
             let mut engine = started(1);
             // A completion for a slot that is not outstanding.
+            assert_eq!(engine.on_completion(0, 0, 8), UdpAction::Post { index: 0 });
             assert_eq!(
                 engine.on_completion(0, 0, 8),
-                UdpAction::Post { index: 0 }
-            );
-            assert_eq!(
-                engine.on_completion(0, 0, 8),
-                UdpAction::Fatal { index: 0, error: ERROR_INVALID_DATA }
+                UdpAction::Fatal {
+                    index: 0,
+                    error: ERROR_INVALID_DATA
+                }
             );
             // A completion for a slot that does not exist.
             assert_eq!(
                 engine.on_completion(7, 0, 8),
-                UdpAction::Fatal { index: 7, error: ERROR_INVALID_DATA }
+                UdpAction::Fatal {
+                    index: 7,
+                    error: ERROR_INVALID_DATA
+                }
             );
         }
 
@@ -967,433 +1233,528 @@ pub mod udp {
             engine.stopped();
             assert!(engine.may_release());
         }
+
+        #[test]
+        fn reset_and_post_errors_count_but_drain_cancellations_do_not() {
+            let mut engine = started(2);
+            engine.on_completion(0, WSAECONNRESET, 0);
+            assert_eq!(engine.statistics.network_errors, 1);
+            engine.mark_posted(0);
+            engine.begin_drain();
+            engine.on_completion(0, 995, 0);
+            engine.on_completion(1, WSAECONNRESET, 0);
+            assert_eq!(engine.statistics.network_errors, 1);
+            let mut refused = started(1);
+            refused.on_post_failure(0);
+            assert_eq!(refused.statistics.network_errors, 1);
+        }
     }
 
     // The datagram path owns its own runtime thread.
 
-pub mod runtime {
-    //! Native UDP engine: a fixed depth of addressed receives, each of which echoes exactly
-    //! the datagram it received and then restores the receive.
-    //!
-    //! This mirrors `ces_engine_run_udp` in the C++ baseline and the Swift port: one
-    //! completion queue, one registered arena, and a socket that is closed before the final
-    //! drain so the outstanding requests are cancelled without leaking storage.
+    pub mod runtime {
+        //! Native UDP engine: a fixed depth of addressed receives, each of which echoes exactly
+        //! the datagram it received and then restores the receive.
+        //!
+        //! This mirrors `ces_engine_run_udp` in the C++ baseline and the Swift port: one
+        //! completion queue, one registered arena, and a socket that is closed before the final
+        //! drain so the outstanding requests are cancelled without leaking storage.
 
-    use core::ffi::c_void;
-    use core::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+        use core::ffi::c_void;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
-    use windows::Win32::minwinbase::OVERLAPPED;
-    use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
+        use windows::Win32::minwinbase::OVERLAPPED;
+        use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
 
-    use crate::native::arena::{udp_stride, Arena};
-    use crate::contract::checked_arena_bytes;
-    use crate::native::{fail_fast, now_milliseconds, report, RioFunctions, SocketOwner};
-    use crate::native::rio::{
-        empty_result, get_queued_completion_status, post_completion, CompletionPort, CompletionQueue,
-        RequestQueue,
-    };
-    use crate::types::{
-        EngineOperation, ExitCode, Options, Protocol, UDP_ADDRESS_BYTES, COMPLETION_BATCH_SIZE,
-        COMPLETION_DRAIN_BATCHES, ERROR_INVALID_DATA, ERROR_IO_INCOMPLETE, ERROR_NOT_ENOUGH_MEMORY,
-        WAIT_TIMEOUT,
-    };
-    use crate::udp::{UdpAction, UdpEngine};
+        use crate::contract::checked_arena_bytes;
+        use crate::native::arena::{Arena, udp_stride};
+        use crate::native::rio::{
+            CompletionPort, CompletionQueue, RequestQueue, empty_result,
+            get_queued_completion_status,
+        };
+        use crate::native::{
+            NativeError, RioFunctions, SocketOwner, fail_fast, now_milliseconds, report,
+        };
+        use crate::types::{
+            COMPLETION_BATCH_SIZE, COMPLETION_DRAIN_BATCHES, ERROR_INVALID_DATA,
+            ERROR_IO_INCOMPLETE, ERROR_NOT_ENOUGH_MEMORY, EngineOperation, ExitCode,
+            NotifySnapshot, Options, Protocol, Statistics, UDP_ADDRESS_BYTES, WAIT_TIMEOUT,
+        };
+        use crate::udp::{UdpAction, UdpEngine};
 
-    /// The RIO request context for one datagram slot. It is the record's first field, so the
-    /// address RIO hands back is the record address.
-    #[repr(C)]
-    pub struct UdpRequest {
-        pub slot_index: u32,
-    }
-
-    /// One slot's native state: the datagram buffer and the sender address RIOReceiveEx fills.
-    #[repr(C)]
-    struct UdpSlotRuntime {
-        request: UdpRequest,
-        payload: RIO_BUF,
-        remote_address: RIO_BUF,
-    }
-
-    impl UdpSlotRuntime {
-        fn request_context(&self) -> *const c_void {
-            &self.request as *const UdpRequest as *const c_void
-        }
-    }
-
-    /// Identity marker whose address is this engine's completion key.
-    struct UdpKey {
-        /// Never read: the key's address is the identity. The field gives the marker a real
-        /// allocation, which is what makes that address unique inside the process.
-        #[allow(dead_code)]
-        marker: u64,
-    }
-
-    struct UdpRuntime {
-        rio: RioFunctions,
-        socket: SocketOwner,
-        port: CompletionPort,
-        queue: CompletionQueue,
-        arena: Arena,
-        request_queue: RequestQueue,
-        slots: Box<[UdpSlotRuntime]>,
-        notification: Box<OVERLAPPED>,
-        key: Box<UdpKey>,
-        engine: UdpEngine,
-        results: Vec<RIORESULT>,
-    }
-
-    impl UdpRuntime {
-        fn notification_address(&self) -> usize {
-            &*self.notification as *const OVERLAPPED as usize
+        /// The RIO request context for one datagram slot. It is the record's first field, so the
+        /// address RIO hands back is the record address.
+        #[repr(C)]
+        pub struct UdpRequest {
+            pub slot_index: u32,
         }
 
-        fn key_address(&self) -> usize {
-            &*self.key as *const UdpKey as usize
+        /// One slot's native state: the datagram buffer and the sender address RIOReceiveEx fills.
+        #[repr(C)]
+        struct UdpSlotRuntime {
+            request: UdpRequest,
+            payload: RIO_BUF,
+            remote_address: RIO_BUF,
         }
 
-        /// Maps a request context back to its slot, refusing anything this engine does not own.
-        fn slot_index(&self, address: usize) -> u32 {
-            let base = self.slots.as_ptr() as usize;
-            let stride = core::mem::size_of::<UdpSlotRuntime>();
-            let extent = stride * self.slots.len();
-            let end = base.saturating_add(extent);
-            if stride == 0 || address < base || address >= end || (address - base) % stride != 0 {
-                fail_fast("server UDP RequestContext range", ERROR_INVALID_DATA);
-            }
-            let index = ((address - base) / stride) as u32;
-            let request = unsafe { &*(address as *const UdpRequest) };
-            if request.slot_index != index {
-                fail_fast("server UDP RequestContext metadata", ERROR_INVALID_DATA);
-            }
-            index
-        }
-
-        /// Arms the completion queue. Every registration is paired with one delivery.
-        fn arm(&mut self, armed: &mut bool) {
-            if self.queue.is_armed() {
-                fail_fast("server duplicate UDP RIONotify", ERROR_INVALID_DATA);
-            }
-            let rio = self.rio;
-            if let Err(error) = self.queue.arm(&rio) {
-                fail_fast("RIONotify(UDP)", error.code);
-            }
-            if !crate::contract::notification_mark_rearmed(armed) {
-                fail_fast("server UDP notification rearm transition", ERROR_INVALID_DATA);
+        impl UdpSlotRuntime {
+            fn request_context(&self) -> *const c_void {
+                &self.request as *const UdpRequest as *const c_void
             }
         }
 
-        /// Posts the operation the slot currently holds: the echo of the datagram it received,
-        /// or the next addressed receive.
-        fn post_slot(&mut self, index: u32) {
-            let rio = self.rio;
-            let outcome = {
-                let Some(slot) = self.slots.get_mut(index as usize) else {
-                    return;
-                };
-                let length = match self.engine.slot(index) {
-                    Some(state) => state.payload_length,
-                    None => 0,
-                };
-                slot.payload.Length = length;
-                let context = slot.request_context();
-                let send = matches!(
-                    self.engine.slot(index).map(|state| state.operation),
-                    Some(EngineOperation::Send)
-                );
-                let queue = &self.request_queue;
-                if send {
-                    queue.send_ex(&rio, &mut slot.payload, &mut slot.remote_address, context)
-                } else {
-                    queue.receive_ex(&rio, &mut slot.payload, &mut slot.remote_address, context)
+        /// Identity marker whose address is this engine's completion key.
+        struct UdpKey {
+            /// Never read: the key's address is the identity. The field gives the marker a real
+            /// allocation, which is what makes that address unique inside the process.
+            #[allow(dead_code)]
+            marker: u64,
+        }
+
+        struct UdpRuntime {
+            rio: RioFunctions,
+            socket: SocketOwner,
+            port: CompletionPort,
+            queue: CompletionQueue,
+            arena: Arena,
+            request_queue: RequestQueue,
+            slots: Box<[UdpSlotRuntime]>,
+            notification: Box<OVERLAPPED>,
+            key: Box<UdpKey>,
+            engine: UdpEngine,
+            results: Vec<RIORESULT>,
+            notification_counters: NotifySnapshot,
+        }
+
+        impl UdpRuntime {
+            /// Creates only idle resources. On failure, local owners release every partial
+            /// allocation before the caller reports the final statistics and diagnostics.
+            /// The second error field is the baseline's network-error count for this stage.
+            fn create(
+                rio: RioFunctions,
+                options: &Options,
+                arena_bytes: usize,
+                stride: u32,
+            ) -> Result<Self, (NativeError, u64)> {
+                let depth = options.udp_depth;
+                let socket =
+                    crate::native::registered_socket(Protocol::Udp).map_err(|error| (error, 1))?;
+                crate::native::configure_socket(socket.raw(), false, options.socket_buffer_bytes)
+                    .map_err(|error| (error, 1))?;
+                crate::native::endpoint::bind_endpoint(socket.raw(), options.port)
+                    .map_err(|error| (error, 1))?;
+                let port = CompletionPort::create().map_err(|error| (error, 0))?;
+                let arena = Arena::create(&rio, arena_bytes, stride).map_err(|error| {
+                    // Arena combines VirtualAlloc and RIO registration. Only the latter
+                    // counts as a network error in the baseline's UDP initialization.
+                    let network_errors = u64::from(error.stage.starts_with("RIORegisterBuffer"));
+                    (error, network_errors)
+                })?;
+                let notification = Box::new(OVERLAPPED::default());
+                let key = Box::new(UdpKey {
+                    marker: 0x5544_5000_0000_0001,
+                });
+                let queue = CompletionQueue::create(
+                    &rio,
+                    &port,
+                    options.cq_capacity,
+                    &*key as *const UdpKey as *mut c_void,
+                    &*notification as *const OVERLAPPED as *mut c_void,
+                )
+                .map_err(|error| (error, 1))?;
+                let slots: Box<[UdpSlotRuntime]> = (0..depth)
+                    .map(|index| UdpSlotRuntime {
+                        request: UdpRequest { slot_index: index },
+                        payload: RIO_BUF::default(),
+                        remote_address: RIO_BUF::default(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let slots_context = slots.as_ptr() as *mut c_void;
+                let request_queue = RequestQueue::create(
+                    &rio,
+                    socket.raw(),
+                    depth,
+                    1,
+                    depth,
+                    1,
+                    queue.raw(),
+                    queue.raw(),
+                    slots_context,
+                )
+                .map_err(|error| (error, 1))?;
+
+                Ok(Self {
+                    rio,
+                    socket,
+                    port,
+                    queue,
+                    arena,
+                    request_queue,
+                    slots,
+                    notification,
+                    key,
+                    engine: UdpEngine::new(depth, options.rio_buffer_bytes),
+                    results: vec![empty_result(); COMPLETION_BATCH_SIZE],
+                    notification_counters: NotifySnapshot::default(),
+                })
+            }
+
+            fn notification_address(&self) -> usize {
+                &*self.notification as *const OVERLAPPED as usize
+            }
+
+            fn key_address(&self) -> usize {
+                &*self.key as *const UdpKey as usize
+            }
+
+            /// Maps a request context back to its slot, refusing anything this engine does not own.
+            fn slot_index(&self, address: usize) -> u32 {
+                let base = self.slots.as_ptr() as usize;
+                let stride = core::mem::size_of::<UdpSlotRuntime>();
+                let extent = stride * self.slots.len();
+                let end = base.saturating_add(extent);
+                if stride == 0 || address < base || address >= end || (address - base) % stride != 0
+                {
+                    fail_fast("server UDP RequestContext range", ERROR_INVALID_DATA);
                 }
-            };
-            match outcome {
-                Ok(()) => self.engine.mark_posted(index),
-                Err(error) => {
-                    report(error.stage, error.code);
-                    self.engine.on_post_failure(index);
+                let index = ((address - base) / stride) as u32;
+                let request = unsafe { &*(address as *const UdpRequest) };
+                if request.slot_index != index {
+                    fail_fast("server UDP RequestContext metadata", ERROR_INVALID_DATA);
                 }
+                index
             }
-        }
-    }
-    /// Runs the UDP echo engine until the stop flag is set or a run deadline passes.
-    pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> ExitCode {
-        let Some(stride) = udp_stride(options.rio_buffer_bytes, UDP_ADDRESS_BYTES) else {
-            report("UDP slot stride", ERROR_NOT_ENOUGH_MEMORY);
-            return ExitCode::Network;
-        };
-        let depth = options.udp_depth;
-        let arena_bytes = match checked_arena_bytes(
-            u64::from(depth),
-            u64::from(stride),
-            options.memory_bytes,
-        ) {
-            Some(bytes) if bytes > 0 && bytes <= u64::from(u32::MAX) && depth <= options.cq_capacity / 2 => {
-                bytes
-            }
-            _ => {
-                report("UDP queue/arena capacity", ERROR_NOT_ENOUGH_MEMORY);
-                return ExitCode::Network;
-            }
-        };
 
-        let socket = match crate::native::registered_socket(Protocol::Udp) {
-            Ok(socket) => socket,
-            Err(error) => {
-                report(error.stage, error.code);
-                return ExitCode::Network;
+            /// Arms the completion queue. Every registration is paired with one delivery.
+            fn arm(&mut self, armed: &mut bool) {
+                if self.queue.is_armed() {
+                    fail_fast("server duplicate UDP RIONotify", ERROR_INVALID_DATA);
+                }
+                *self.notification = OVERLAPPED::default();
+                let rio = self.rio;
+                if let Err(error) = self.queue.arm(&rio) {
+                    fail_fast(
+                        if error.code == 10_037 {
+                            "RIONotify duplicate arm"
+                        } else {
+                            "RIONotify(UDP)"
+                        },
+                        error.code,
+                    );
+                }
+                self.notification_counters.arms = self.notification_counters.arms.wrapping_add(1);
+                if !crate::contract::notification_mark_rearmed(armed) {
+                    fail_fast(
+                        "server UDP notification rearm transition",
+                        ERROR_INVALID_DATA,
+                    );
+                }
             }
-        };
-        if let Err(error) = crate::native::configure_socket(socket.raw(), false, options.socket_buffer_bytes) {
-            report(error.stage, error.code);
-            return ExitCode::Network;
-        }
-        if let Err(error) = crate::native::endpoint::bind_endpoint(socket.raw(), options.port) {
-            report(error.stage, error.code);
-            return ExitCode::Network;
-        }
-        let port = match CompletionPort::create() {
-            Ok(port) => port,
-            Err(error) => {
-                report(error.stage, error.code);
-                return ExitCode::Network;
-            }
-        };
-        let arena = match Arena::create(&rio, arena_bytes as usize) {
-            Ok(arena) => arena,
-            Err(error) => {
-                report(error.stage, error.code);
-                return ExitCode::Network;
-            }
-        };
-        let notification = Box::new(OVERLAPPED::default());
-        let key = Box::new(UdpKey { marker: 0x5544_5000_0000_0001 });
-        let queue = match CompletionQueue::create(
-            &rio,
-            &port,
-            options.cq_capacity,
-            &*key as *const UdpKey as *mut c_void,
-            &*notification as *const OVERLAPPED as *mut c_void,
-        ) {
-            Ok(queue) => queue,
-            Err(error) => {
-                report(error.stage, error.code);
-                return ExitCode::Network;
-            }
-        };
-        let slots: Box<[UdpSlotRuntime]> = (0..depth)
-            .map(|index| UdpSlotRuntime {
-                request: UdpRequest { slot_index: index },
-                payload: RIO_BUF::default(),
-                remote_address: RIO_BUF::default(),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let slots_context = slots.as_ptr() as *mut c_void;
-        let request_queue = match RequestQueue::create(
-            &rio,
-            socket.raw(),
-            depth,
-            1,
-            depth,
-            1,
-            queue.raw(),
-            queue.raw(),
-            slots_context,
-        ) {
-            Ok(request_queue) => request_queue,
-            Err(error) => {
-                report(error.stage, error.code);
-                return ExitCode::Network;
-            }
-        };
 
-        let mut runtime = UdpRuntime {
-            rio,
-            socket,
-            port,
-            queue,
-            arena,
-            request_queue,
-            slots,
-            notification,
-            key,
-            engine: UdpEngine::new(depth, options.rio_buffer_bytes),
-            results: vec![empty_result(); COMPLETION_BATCH_SIZE],
-        };
-
-        // Every slot starts with an addressed receive over the datagram part of its region and
-        // the sender address area right behind it.
-        for index in 0..depth {
-            let payload = match runtime
-                .arena
-                .slot_tail_view(index, stride, 0, options.rio_buffer_bytes)
-            {
-                Ok(view) => view,
-                Err(error) => {
-                    report(error.stage, error.code);
-                    runtime.engine.on_post_failure(index);
-                    break;
-                }
-            };
-            let remote = match runtime.arena.slot_tail_view(
-                index,
-                stride,
-                options.rio_buffer_bytes,
-                UDP_ADDRESS_BYTES as u32,
-            ) {
-                Ok(view) => view,
-                Err(error) => {
-                    report(error.stage, error.code);
-                    runtime.engine.on_post_failure(index);
-                    break;
-                }
-            };
-            runtime.slots[index as usize].payload = payload;
-            runtime.slots[index as usize].remote_address = remote;
-            runtime.post_slot(index);
-            if runtime.engine.failed {
-                break;
-            }
-        }
-
-        let start = now_milliseconds();
-        let run_deadline = if options.run_seconds == 0 {
-            u64::MAX
-        } else {
-            start.saturating_add(u64::from(options.run_seconds) * 1_000)
-        };
-        let mut armed = false;
-        if runtime.engine.outstanding != 0 {
-            runtime.arm(&mut armed);
-        }
-
-        while !runtime.engine.closing || runtime.engine.outstanding != 0 {
-            if runtime.engine.outstanding != 0 && !runtime.queue.is_armed() {
-                runtime.arm(&mut armed);
-            }
-            let expired = now_milliseconds() >= run_deadline;
-            let stop_now = stop.load(Ordering::Acquire);
-            // Closing the socket is what cancels the posted requests, so it has to follow from closing
-            // alone and not only from the stop request: an error path sets closing without closing the
-            // socket, and a drain waiting for completions that can never arrive never ends. Both calls
-            // are idempotent, so running them while closing is safe.
-            if runtime.engine.closing || stop_now || expired {
-                runtime.engine.begin_drain();
-                runtime.socket.reset();
-            }
-            let packet = get_queued_completion_status(runtime.port.raw(), 100);
-            if packet.overlapped as usize == runtime.notification_address() {
-                if !packet.succeeded {
-                    fail_fast("GetQueuedCompletionStatus(UDP notification)", packet.error as i32);
-                }
-                if !crate::contract::notification_packet_matches(
-                    packet.key,
-                    packet.overlapped as usize,
-                    runtime.key_address(),
-                    runtime.notification_address(),
-                ) {
-                    fail_fast("server UDP RIO notification key", ERROR_INVALID_DATA);
-                }
-                if !crate::contract::notification_mark_delivered(&mut armed) {
-                    fail_fast("server UDP notification delivery transition", ERROR_INVALID_DATA);
-                }
-                runtime.queue.on_delivery();
-                let rio = runtime.rio;
-                for _ in 0..COMPLETION_DRAIN_BATCHES {
-                    // A saturated flood can keep the queue non-empty indefinitely, so the
-                    // bounded drain also observes the stop request and the run deadline: the
-                    // socket is closed here and no further request is reposted, which is what
-                    // keeps a controlled stop bounded under full load.
-                    if runtime.engine.closing
-                        || stop.load(Ordering::Acquire)
-                        || now_milliseconds() >= run_deadline
-                    {
-                        runtime.engine.begin_drain();
-                        runtime.socket.reset();
-                    }
-                    let count = match runtime.queue.dequeue(&rio, &mut runtime.results) {
-                        Ok(count) => count,
-                        Err(error) => fail_fast("RIODequeueCompletion(UDP)", error.code),
+            /// Posts the operation the slot currently holds: the echo of the datagram it received,
+            /// or the next addressed receive.
+            fn post_slot(&mut self, index: u32) {
+                let rio = self.rio;
+                let outcome = {
+                    let Some(slot) = self.slots.get_mut(index as usize) else {
+                        return;
                     };
-                    if count == 0 {
+                    let length = match self.engine.slot(index) {
+                        Some(state) => state.payload_length,
+                        None => 0,
+                    };
+                    slot.payload.Length = length;
+                    let context = slot.request_context();
+                    let send = matches!(
+                        self.engine.slot(index).map(|state| state.operation),
+                        Some(EngineOperation::Send)
+                    );
+                    let queue = &self.request_queue;
+                    if send {
+                        queue.send_ex(&rio, &mut slot.payload, &mut slot.remote_address, context)
+                    } else {
+                        queue.receive_ex(&rio, &mut slot.payload, &mut slot.remote_address, context)
+                    }
+                };
+                match outcome {
+                    Ok(()) => self.engine.mark_posted(index),
+                    Err(error) => {
+                        report(error.stage, error.code);
+                        self.engine.on_post_failure(index);
+                    }
+                }
+            }
+        }
+
+        impl Drop for UdpRuntime {
+            fn drop(&mut self) {
+                if self.engine.outstanding != 0 {
+                    fail_fast(
+                        "UDP cleanup with outstanding operations",
+                        ERROR_IO_INCOMPLETE,
+                    );
+                }
+                self.socket.reset();
+                let rio = self.rio;
+                self.queue.close(&rio);
+                self.arena.destroy(&rio);
+            }
+        }
+
+        /// Every run past capacity validation reports once, including initialization failure.
+        /// A pending final notification keeps its storage alive until cleanup closes the port.
+        fn finish_udp(
+            options: &Options,
+            statistics: Statistics,
+            elapsed: u64,
+            snapshot: NotifySnapshot,
+            failed: bool,
+            cleanup: impl FnOnce(),
+        ) -> ExitCode {
+            if options.stats {
+                println!("{}", statistics.final_line(Protocol::Udp, elapsed, 1, 0));
+            }
+            cleanup();
+            crate::native::write_diagnostics(&[snapshot], Protocol::Udp);
+            if failed {
+                ExitCode::Network
+            } else {
+                ExitCode::Success
+            }
+        }
+
+        /// Runs the UDP echo engine until the stop flag is set or a run deadline passes.
+        pub fn run_udp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> ExitCode {
+            let Some(stride) = udp_stride(options.rio_buffer_bytes, UDP_ADDRESS_BYTES) else {
+                report("UDP slot stride", ERROR_NOT_ENOUGH_MEMORY);
+                return ExitCode::Usage;
+            };
+            let depth = options.udp_depth;
+            let arena_bytes = match checked_arena_bytes(
+                u64::from(depth),
+                u64::from(stride),
+                options.memory_bytes,
+            ) {
+                Some(bytes)
+                    if bytes > 0
+                        && bytes <= u64::from(u32::MAX)
+                        && depth <= options.cq_capacity / 2 =>
+                {
+                    bytes
+                }
+                _ => {
+                    report("UDP queue/arena capacity", ERROR_NOT_ENOUGH_MEMORY);
+                    return ExitCode::Usage;
+                }
+            };
+
+            let mut runtime = match UdpRuntime::create(rio, options, arena_bytes as usize, stride) {
+                Ok(runtime) => runtime,
+                Err((error, network_errors)) => {
+                    report(error.stage, error.code);
+                    // The baseline starts timing after initialization, even if it failed.
+                    // No request was posted, and the builder already dropped all owners.
+                    let start = now_milliseconds();
+                    let statistics = Statistics {
+                        network_errors,
+                        ..Statistics::default()
+                    };
+                    return finish_udp(
+                        options,
+                        statistics,
+                        now_milliseconds().saturating_sub(start),
+                        NotifySnapshot::default(),
+                        true,
+                        || {},
+                    );
+                }
+            };
+
+            // Every slot starts with an addressed receive over the datagram part of its region and
+            // the sender address area right behind it.
+            for index in 0..depth {
+                let payload =
+                    match runtime
+                        .arena
+                        .slot_tail_view(index, stride, 0, options.rio_buffer_bytes)
+                    {
+                        Ok(view) => view,
+                        Err(error) => {
+                            report(error.stage, error.code);
+                            runtime.engine.on_post_failure(index);
+                            break;
+                        }
+                    };
+                let remote = match runtime.arena.slot_tail_view(
+                    index,
+                    stride,
+                    options.rio_buffer_bytes,
+                    UDP_ADDRESS_BYTES as u32,
+                ) {
+                    Ok(view) => view,
+                    Err(error) => {
+                        report(error.stage, error.code);
+                        runtime.engine.on_post_failure(index);
                         break;
                     }
-                    for position in 0..count as usize {
-                        let result = runtime.results[position];
-                        let index = runtime.slot_index(result.RequestContext as usize);
-                        match runtime
-                            .engine
-                            .on_completion(index, result.Status, result.BytesTransferred)
-                        {
-                            UdpAction::Post { index } => runtime.post_slot(index),
-                            UdpAction::Fatal { error, .. } => {
-                        // The engine gave up on the socket, so cancel the posted requests here as well
-                        // instead of leaving the drain to wait for completions the socket still holds.
-                        report("UDP RIO completion", error);
-                        runtime.engine.begin_drain();
-                        runtime.socket.reset();
+                };
+                runtime.slots[index as usize].payload = payload;
+                runtime.slots[index as usize].remote_address = remote;
+                runtime.post_slot(index);
+                if runtime.engine.failed {
+                    break;
+                }
+            }
+
+            let start = now_milliseconds();
+            let run_deadline = if options.run_seconds == 0 {
+                u64::MAX
+            } else {
+                start.saturating_add(u64::from(options.run_seconds) * 1_000)
+            };
+            let mut armed = false;
+            if runtime.engine.outstanding != 0 {
+                runtime.arm(&mut armed);
+            }
+
+            while !runtime.engine.closing || runtime.engine.outstanding != 0 {
+                if runtime.engine.outstanding != 0 && !runtime.queue.is_armed() {
+                    runtime.arm(&mut armed);
+                }
+                let expired = now_milliseconds() >= run_deadline;
+                let stop_now = stop.load(Ordering::Acquire);
+                // Closing the socket is what cancels the posted requests, so it has to follow from closing
+                // alone and not only from the stop request: an error path sets closing without closing the
+                // socket, and a drain waiting for completions that can never arrive never ends. Both calls
+                // are idempotent, so running them while closing is safe.
+                if runtime.engine.closing || stop_now || expired {
+                    runtime.engine.begin_drain();
+                    runtime.socket.reset();
+                }
+                let packet = get_queued_completion_status(runtime.port.raw(), 100);
+                if packet.overlapped as usize == runtime.notification_address() {
+                    if !packet.succeeded {
+                        fail_fast(
+                            "GetQueuedCompletionStatus(UDP notification)",
+                            packet.error as i32,
+                        );
                     }
-                            UdpAction::None => {}
+                    if !crate::contract::notification_packet_matches(
+                        packet.key,
+                        packet.overlapped as usize,
+                        runtime.key_address(),
+                        runtime.notification_address(),
+                    ) {
+                        fail_fast("server UDP RIO notification key", ERROR_INVALID_DATA);
+                    }
+                    if !crate::contract::notification_mark_delivered(&mut armed) {
+                        fail_fast(
+                            "server UDP notification delivery transition",
+                            ERROR_INVALID_DATA,
+                        );
+                    }
+                    runtime.queue.on_delivery();
+                    runtime.notification_counters.deliveries =
+                        runtime.notification_counters.deliveries.wrapping_add(1);
+                    let rio = runtime.rio;
+                    for _ in 0..COMPLETION_DRAIN_BATCHES {
+                        // A saturated flood can keep the queue non-empty indefinitely, so the
+                        // bounded drain also observes the stop request and the run deadline: the
+                        // socket is closed here and no further request is reposted, which is what
+                        // keeps a controlled stop bounded under full load.
+                        if runtime.engine.closing
+                            || stop.load(Ordering::Acquire)
+                            || now_milliseconds() >= run_deadline
+                        {
+                            runtime.engine.begin_drain();
+                            runtime.socket.reset();
+                        }
+                        let count = match runtime.queue.dequeue(&rio, &mut runtime.results) {
+                            Ok(count) => count,
+                            Err(error) => fail_fast("RIODequeueCompletion(UDP)", error.code),
+                        };
+                        if count == 0 {
+                            break;
+                        }
+                        for position in 0..count as usize {
+                            let result = runtime.results[position];
+                            let index = runtime.slot_index(result.RequestContext as usize);
+                            if runtime.engine.outstanding == 0
+                                || !runtime
+                                    .engine
+                                    .slot(index)
+                                    .is_some_and(|slot| slot.outstanding)
+                            {
+                                fail_fast("UDP completion invariant", ERROR_INVALID_DATA);
+                            }
+                            match runtime.engine.on_completion(
+                                index,
+                                result.Status,
+                                result.BytesTransferred,
+                            ) {
+                                UdpAction::Post { index } => runtime.post_slot(index),
+                                UdpAction::Fatal { error, .. } => {
+                                    // The engine gave up on the socket, so cancel the posted requests here as well
+                                    // instead of leaving the drain to wait for completions the socket still holds.
+                                    report("UDP RIO completion", error);
+                                    runtime.engine.begin_drain();
+                                    runtime.socket.reset();
+                                }
+                                UdpAction::None => {}
+                            }
                         }
                     }
+                } else if !packet.succeeded && packet.error != WAIT_TIMEOUT {
+                    fail_fast("GetQueuedCompletionStatus(UDP)", packet.error as i32);
+                } else if !packet.succeeded
+                    && packet.error == WAIT_TIMEOUT
+                    && packet.overlapped.is_null()
+                {
+                    if !runtime.engine.closing && runtime.engine.outstanding != 0 && !armed {
+                        runtime.notification_counters.timeout_wakeups = runtime
+                            .notification_counters
+                            .timeout_wakeups
+                            .wrapping_add(1);
+                    }
+                } else {
+                    fail_fast("unexpected UDP IOCP packet", ERROR_INVALID_DATA);
                 }
-            } else if !packet.succeeded && packet.error != WAIT_TIMEOUT {
-                fail_fast("GetQueuedCompletionStatus(UDP)", packet.error as i32);
-            } else if !(!packet.succeeded && packet.error == WAIT_TIMEOUT && packet.overlapped.is_null()) {
-                fail_fast("unexpected UDP IOCP packet", ERROR_INVALID_DATA);
             }
-        }
 
-        // A socket that was closed for the drain is already gone; one closed by a failure still
-        // has to be released here.
-        runtime.socket.reset();
-        if armed {
-            if let Err(error) = post_completion(runtime.port.raw(), 0, &mut *runtime.notification) {
-                fail_fast("PostQueuedCompletionStatus(UDP notification shutdown)", error.code);
+            // A socket that was closed for the drain is already gone; one closed by a failure still
+            // has to be released here.
+            runtime.socket.reset();
+            // A final real notification may still be pending after all operations retire.
+            // Its OVERLAPPED stays alive until the port closes; never forge a delivery.
+            if cfg!(debug_assertions) && !runtime.notification_counters.valid() {
+                fail_fast("UDP notification accounting", 5023);
             }
-            let packet = get_queued_completion_status(runtime.port.raw(), 1_000);
-            if !packet.succeeded {
-                fail_fast("GetQueuedCompletionStatus(UDP notification shutdown)", packet.error as i32);
+            if runtime.engine.outstanding != 0 {
+                fail_fast(
+                    "UDP cleanup with outstanding operations",
+                    ERROR_IO_INCOMPLETE,
+                );
             }
-            if !crate::contract::notification_packet_matches(
-                packet.key,
-                packet.overlapped as usize,
-                0,
-                runtime.notification_address(),
-            ) {
-                fail_fast("UDP notification shutdown packet", ERROR_INVALID_DATA);
+            runtime.engine.stopped();
+            if !runtime.engine.may_release() {
+                fail_fast("UDP release precondition", ERROR_INVALID_DATA);
             }
-            if !crate::contract::notification_mark_delivered(&mut armed) {
-                fail_fast("UDP notification shutdown transition", ERROR_INVALID_DATA);
-            }
+            let elapsed = now_milliseconds().saturating_sub(start);
+            let statistics = runtime.engine.statistics;
+            let failed = runtime.engine.failed;
+            let snapshot = runtime.notification_counters;
+            finish_udp(options, statistics, elapsed, snapshot, failed, || {
+                // Release order of the baseline: completion queue, registration and arena, then
+                // the socket and port. Nothing is outstanding, so no completion can be lost.
+                let rio = runtime.rio;
+                runtime.queue.close(&rio);
+                runtime.arena.destroy(&rio);
+                drop(runtime);
+            })
         }
-        if runtime.engine.outstanding != 0 {
-            fail_fast("UDP cleanup with outstanding operations", ERROR_IO_INCOMPLETE);
-        }
-        runtime.engine.stopped();
-        if !runtime.engine.may_release() {
-            fail_fast("UDP release precondition", ERROR_INVALID_DATA);
-        }
-        let elapsed = now_milliseconds().saturating_sub(start);
-        let statistics = runtime.engine.statistics;
-        let failed = runtime.engine.failed;
-        if options.stats {
-            println!(
-                "{}",
-                statistics.final_line(Protocol::Udp, elapsed, 1, runtime.engine.outstanding)
-            );
-        }
-        // Release order of the baseline: completion queue, registration and arena, then the
-        // socket, then the port. Nothing is outstanding, so no completion can be lost.
-        let rio = runtime.rio;
-        runtime.queue.close(&rio);
-        runtime.arena.destroy(&rio);
-        drop(runtime);
-        if failed { ExitCode::Network } else { ExitCode::Success }
     }
-}
 }
 
 pub mod worker {
@@ -1409,26 +1770,26 @@ pub mod worker {
     use core::mem::size_of;
     use core::ptr;
     use core::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     use windows::Win32::minwinbase::OVERLAPPED;
     use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
     use windows::Win32::winsock2::INVALID_SOCKET;
 
-    use crate::acceptor::AcceptTable;
-    use crate::native::arena::Arena;
+    use crate::acceptor::{AcceptTable, AdmissionCredits};
     use crate::contract::notification_packet_matches;
     use crate::engine::{Step, TcpEngine};
-    use crate::native::{
-        fail_fast, now_milliseconds, report, NativeError, RioFunctions, SendHandle, SocketOwner,
-    };
+    use crate::native::arena::Arena;
     use crate::native::rio::{
-        empty_result, get_queued_completion_status, post_completion, CompletionPort, CompletionQueue,
-        RequestQueue,
+        CompletionPort, CompletionQueue, RequestQueue, empty_result, get_queued_completion_status,
+        post_completion,
+    };
+    use crate::native::{
+        NativeError, RioFunctions, SendHandle, SocketOwner, fail_fast, now_milliseconds, report,
     };
     use crate::types::{
-        EngineOperation, Statistics, WorkerPhase, ADMISSION_CLOSED_KEY, COMPLETION_BATCH_SIZE,
-        COMPLETION_DRAIN_BATCHES, ERROR_INVALID_DATA, STOP_KEY, WAIT_TIMEOUT,
+        ADMISSION_CLOSED_KEY, COMPLETION_BATCH_SIZE, COMPLETION_DRAIN_BATCHES, ERROR_INVALID_DATA,
+        EngineOperation, NotifySnapshot, STOP_KEY, Statistics, WAIT_TIMEOUT, WorkerPhase,
     };
 
     /// The RIO request context. It is the first field of a connection record, so the address
@@ -1484,13 +1845,11 @@ pub mod worker {
 
     /// What the coordinator reports for one worker after it has joined.
     pub struct WorkerReport {
-        pub index: u32,
         pub statistics: Statistics,
-        pub active: u32,
+        pub notification: NotifySnapshot,
     }
 
     pub struct TcpWorker {
-        index: u32,
         rio: RioFunctions,
         stride: u32,
         port: CompletionPort,
@@ -1502,6 +1861,8 @@ pub mod worker {
         connections: Box<[ConnectionRuntime]>,
         engine: TcpEngine,
         failure: Arc<AtomicBool>,
+        credits: Arc<AdmissionCredits>,
+        notification_counters: NotifySnapshot,
     }
     impl TcpWorker {
         /// Builds a worker: completion port, completion queue, registered arena and the
@@ -1519,23 +1880,35 @@ pub mod worker {
             failure: Arc<AtomicBool>,
         ) -> Result<Self, NativeError> {
             if stride == 0 || slot_count == 0 {
-                return Err(NativeError { stage: "worker registered arena size", code: 8 });
+                return Err(NativeError {
+                    stage: "worker registered arena size",
+                    code: 8,
+                });
             }
             let arena_bytes = crate::contract::checked_arena_bytes(
                 u64::from(slot_count),
                 u64::from(stride),
                 memory_share,
             )
-            .ok_or(NativeError { stage: "worker registered arena size", code: 8 })?;
+            .ok_or(NativeError {
+                stage: "worker registered arena size",
+                code: 8,
+            })?;
             if arena_bytes == 0 || arena_bytes > u64::from(u32::MAX) {
-                return Err(NativeError { stage: "worker registered arena size", code: 8 });
+                return Err(NativeError {
+                    stage: "worker registered arena size",
+                    code: 8,
+                });
             }
             // Two queue entries per connection, exactly what the connection capacity reserved
             // out of /cq.
             let capacity = slot_count.checked_mul(2).unwrap_or(slot_count);
             let port = CompletionPort::create()?;
             let notification = Box::new(OVERLAPPED::default());
-            let key = Box::new(WorkerKey { index, marker: 0x574F_524B_0000_0000 | u64::from(index) });
+            let key = Box::new(WorkerKey {
+                index,
+                marker: 0x574F_524B_0000_0000 | u64::from(index),
+            });
             let queue = CompletionQueue::create(
                 &rio,
                 &port,
@@ -1543,10 +1916,13 @@ pub mod worker {
                 &*key as *const WorkerKey as *mut c_void,
                 &*notification as *const OVERLAPPED as *mut c_void,
             )?;
-            let arena = Arena::create(&rio, arena_bytes as usize)?;
+            let arena = Arena::create(&rio, arena_bytes as usize, stride)?;
             let connections: Box<[ConnectionRuntime]> = (0..slot_count)
                 .map(|slot| ConnectionRuntime {
-                    request: Request { connection_index: slot, operation: EngineOperation::Receive },
+                    request: Request {
+                        connection_index: slot,
+                        operation: EngineOperation::Receive,
+                    },
                     socket: SocketOwner::new(INVALID_SOCKET),
                     request_queue: None,
                     buffer: RIO_BUF::default(),
@@ -1555,7 +1931,6 @@ pub mod worker {
                 .into_boxed_slice();
             let engine = TcpEngine::new(slot_count, timeout_milliseconds);
             Ok(Self {
-                index,
                 rio,
                 stride,
                 port,
@@ -1567,6 +1942,11 @@ pub mod worker {
                 connections,
                 engine,
                 failure,
+                credits: Arc::new(AdmissionCredits::new(slot_count)),
+                notification_counters: NotifySnapshot {
+                    worker: index,
+                    ..NotifySnapshot::default()
+                },
             })
         }
 
@@ -1576,6 +1956,10 @@ pub mod worker {
 
         pub fn slot_count(&self) -> u32 {
             self.engine.slot_count()
+        }
+
+        pub fn admission_credits(&self) -> Arc<AdmissionCredits> {
+            Arc::clone(&self.credits)
         }
 
         fn key_address(&self) -> usize {
@@ -1593,7 +1977,12 @@ pub mod worker {
         }
 
         /// Runs the worker loop until admission closed and every connection drained.
-        pub fn run(&mut self, stop: &Arc<AtomicBool>, accept: &AcceptTable, ready: SendHandle) -> WorkerReport {
+        pub fn run(
+            &mut self,
+            stop: &Arc<AtomicBool>,
+            accept: &OnceLock<Arc<AcceptTable>>,
+            ready: SendHandle,
+        ) -> WorkerReport {
             if !set_ready(ready) {
                 fail_fast("SetEvent(worker ready)", 6);
             }
@@ -1602,14 +1991,15 @@ pub mod worker {
                 // connections with requests in flight, so an idle worker never holds a pending
                 // RIONotify. RIONotify called with a non-empty queue notifies immediately, so a
                 // completion that arrives between the post and the arm cannot be lost.
-                if self.engine.active_count() != 0 && !self.queue.is_armed() {
-                    self.arm();
-                }
+                self.maybe_arm();
                 let wait = self.engine.waiting_milliseconds(now_milliseconds());
                 let packet = get_queued_completion_status(self.port.raw(), wait);
                 if packet.overlapped as usize == self.notification_address() {
                     if !packet.succeeded {
-                        fail_fast("GetQueuedCompletionStatus(worker notification)", packet.error as i32);
+                        fail_fast(
+                            "GetQueuedCompletionStatus(worker notification)",
+                            packet.error as i32,
+                        );
                     }
                     if !notification_packet_matches(
                         packet.key,
@@ -1619,10 +2009,14 @@ pub mod worker {
                     ) {
                         fail_fast("server worker RIO notification key", ERROR_INVALID_DATA);
                     }
-                    if !crate::contract::notification_mark_delivered(&mut self.engine.notification_armed) {
+                    if !crate::contract::notification_mark_delivered(
+                        &mut self.engine.notification_armed,
+                    ) {
                         fail_fast("server worker notification delivery transition", 5023);
                     }
                     self.queue.on_delivery();
+                    self.notification_counters.deliveries =
+                        self.notification_counters.deliveries.wrapping_add(1);
                     self.drain(stop);
                 } else if packet.overlapped.is_null() && packet.key == STOP_KEY {
                     let steps = self.engine.begin_stop();
@@ -1630,13 +2024,32 @@ pub mod worker {
                 } else if packet.overlapped.is_null() && packet.key == ADMISSION_CLOSED_KEY {
                     self.engine.close_admission();
                 } else if packet.overlapped.is_null() && packet.key > ADMISSION_CLOSED_KEY {
+                    let Some(accept) = accept.get() else {
+                        fail_fast(
+                            "server accept handoff before table publication",
+                            ERROR_INVALID_DATA,
+                        );
+                    };
                     self.take_socket(accept, packet.key);
                 } else if !packet.succeeded && packet.error != WAIT_TIMEOUT {
                     report("GetQueuedCompletionStatus(worker)", packet.error as i32);
+                    self.engine.statistics.network_errors =
+                        self.engine.statistics.network_errors.wrapping_add(1);
                     self.failure.store(true, Ordering::Release);
                     let steps = self.engine.begin_stop();
                     self.execute_all(steps);
-                } else if !(!packet.succeeded && packet.error == WAIT_TIMEOUT && packet.overlapped.is_null()) {
+                } else if !packet.succeeded
+                    && packet.error == WAIT_TIMEOUT
+                    && packet.overlapped.is_null()
+                {
+                    if !self.engine.stopping
+                        && self.engine.outstanding() != 0
+                        && !self.engine.notification_armed
+                    {
+                        self.notification_counters.timeout_wakeups =
+                            self.notification_counters.timeout_wakeups.wrapping_add(1);
+                    }
+                } else {
                     fail_fast("unexpected worker IOCP packet", ERROR_INVALID_DATA);
                 }
                 if self.engine.fatal {
@@ -1645,22 +2058,29 @@ pub mod worker {
                 let mut expired = Vec::new();
                 let steps = self.engine.on_timeout(now_milliseconds(), &mut expired);
                 self.execute_all(steps);
-                if self.engine.stopping && self.engine.admission_closed && self.engine.active_count() == 0 {
+                if self.engine.stopping
+                    && self.engine.admission_closed
+                    && self.engine.active_count() == 0
+                {
                     break;
                 }
             }
-            // Lazy arming means no registration can be left once nothing has work in flight.
-            if self.engine.notification_armed {
-                report("server worker notification unarmed precondition", 5023);
-            }
-            if !self.engine.may_exit() {
+            // At most one real RIONotify delivery may remain pending. The OVERLAPPED and
+            // completion key stay allocated until the port closes; no synthetic packet is used.
+            if self.engine.outstanding() != 0
+                || !self.engine.may_exit()
+                || self.engine.free_count() != self.engine.slot_count()
+                || !self.credits.is_full()
+            {
                 fail_fast("server worker release precondition", 5023);
+            }
+            if cfg!(debug_assertions) && !self.notification_counters.valid() {
+                fail_fast("server worker notification accounting", 5023);
             }
             self.engine.phase = WorkerPhase::Stopped;
             WorkerReport {
-                index: self.index,
                 statistics: self.engine.statistics,
-                active: self.engine.active_count(),
+                notification: self.notification_counters,
             }
         }
 
@@ -1671,23 +2091,48 @@ pub mod worker {
         pub fn destroy(mut self) {
             let rio = self.rio;
             self.queue.close(&rio);
+            self.arena.destroy(&rio);
             for runtime in self.connections.iter_mut() {
                 runtime.release();
             }
+        }
+    }
+
+    impl Drop for TcpWorker {
+        fn drop(&mut self) {
+            if self.engine.outstanding() != 0 {
+                fail_fast("worker RIO cleanup with outstanding operations", 996);
+            }
+            let rio = self.rio;
+            self.queue.close(&rio);
             self.arena.destroy(&rio);
         }
     }
     impl TcpWorker {
+        fn maybe_arm(&mut self) {
+            if self.engine.outstanding() != 0 && !self.queue.is_armed() {
+                self.arm();
+            }
+        }
         /// Arms the completion queue. Every call is paired with a delivery: the armed flag in
         /// the engine and the queue's own flag move together.
         fn arm(&mut self) {
             if self.queue.is_armed() {
                 fail_fast("server duplicate worker RIONotify", 5023);
             }
+            *self.notification = OVERLAPPED::default();
             let rio = self.rio;
             if let Err(error) = self.queue.arm(&rio) {
-                fail_fast("RIONotify(worker)", error.code);
+                fail_fast(
+                    if error.code == 10_037 {
+                        "RIONotify duplicate arm"
+                    } else {
+                        "RIONotify(worker)"
+                    },
+                    error.code,
+                );
             }
+            self.notification_counters.arms = self.notification_counters.arms.wrapping_add(1);
             if !crate::contract::notification_mark_rearmed(&mut self.engine.notification_armed) {
                 fail_fast("server worker notification rearm transition", 5023);
             }
@@ -1751,12 +2196,20 @@ pub mod worker {
         }
 
         fn execute(&mut self, step: Option<Step>) {
+            if self.engine.fatal {
+                fail_fast("worker engine invariant", ERROR_INVALID_DATA);
+            }
             match step {
                 None => {}
                 Some(Step::Close { index }) => self.close_slot(index),
                 Some(Step::Release { index }) => self.release_slot(index),
                 Some(Step::Receive { index, .. }) => self.post_receive(index),
-                Some(Step::Send { index, offset, length, .. }) => self.post_send(index, offset, length),
+                Some(Step::Send {
+                    index,
+                    offset,
+                    length,
+                    ..
+                }) => self.post_send(index, offset, length),
             }
         }
 
@@ -1768,7 +2221,7 @@ pub mod worker {
                     return;
                 };
                 runtime.request.operation = EngineOperation::Receive;
-                runtime.buffer.Offset = index * stride;
+                runtime.buffer.Offset = 0;
                 runtime.buffer.Length = stride;
                 let context = runtime.request_context();
                 match runtime.request_queue.as_ref() {
@@ -1783,6 +2236,8 @@ pub mod worker {
                 report(error.stage, error.code);
                 let step = self.engine.on_post_failure(index);
                 self.execute(step);
+            } else {
+                self.maybe_arm();
             }
         }
 
@@ -1798,7 +2253,7 @@ pub mod worker {
                     return;
                 };
                 runtime.request.operation = EngineOperation::Send;
-                runtime.buffer.Offset = index * stride + offset;
+                runtime.buffer.Offset = offset;
                 runtime.buffer.Length = length;
                 let context = runtime.request_context();
                 match runtime.request_queue.as_ref() {
@@ -1813,6 +2268,8 @@ pub mod worker {
                 report(error.stage, error.code);
                 let step = self.engine.on_post_failure(index);
                 self.execute(step);
+            } else {
+                self.maybe_arm();
             }
         }
 
@@ -1831,6 +2288,7 @@ pub mod worker {
         fn release_slot(&mut self, index: u32) {
             if let Some(runtime) = self.connections.get_mut(index as usize) {
                 runtime.release();
+                self.credits.release();
             }
         }
 
@@ -1844,19 +2302,19 @@ pub mod worker {
             let Some(raw) = accept.take_socket(index) else {
                 // The acceptor withdrew the socket (a reset peer or a stop): the slot only has
                 // to be acknowledged so it can be recycled.
+                self.credits.release();
                 self.ack(accept, index);
-                return;
+                fail_fast("server accept handoff socket", ERROR_INVALID_DATA);
             };
             let mut socket = SocketOwner::new(raw);
             let Some(slot) = self.engine.take_slot() else {
-                // Stopping, or the table is full: closing the socket is the baseline's refused
-                // handoff, and the acceptor reposts the operation. Only a full table is a capacity
-                // refusal, so only that one is counted.
-                if !self.engine.is_stopping() {
-                    self.engine.statistics.rejected =
-                        self.engine.statistics.rejected.wrapping_add(1);
-                }
+                // A published handoff already owns one reservation. A live worker must
+                // therefore have a free slot; stopping instead returns that reservation.
+                self.credits.release();
                 self.ack(accept, index);
+                if !self.engine.is_stopping() {
+                    fail_fast("admission credit/free pool mismatch", 5023);
+                }
                 return;
             };
             let prepared = {
@@ -1893,6 +2351,7 @@ pub mod worker {
                         self.engine.statistics.network_errors.wrapping_add(1);
                     report(error.stage, error.code);
                     self.engine.return_slot(slot);
+                    self.credits.release();
                     self.ack(accept, index);
                     return;
                 }
@@ -1923,900 +2382,1135 @@ pub mod worker {
 
     // The worker owns its TCP runtime, its request queue and its timer wheel.
 
-pub mod tcp {
-    //! TCP admission and coordination.
-    //!
-    //! The acceptor thread pre-posts AcceptEx operations on its own completion port, hands
-    //! each accepted socket to a worker through that worker's port and recycles the operation
-    //! once the worker acknowledges it. The coordinator owns the stop order, which is the
-    //! baseline's: close admission and join the acceptor first, then publish the
-    //! admission-closed barrier plus stop to every worker, join them, then report.
+    pub mod tcp {
+        //! TCP admission and coordination.
+        //!
+        //! The acceptor thread pre-posts AcceptEx operations on its own completion port, hands
+        //! each accepted socket to a worker through that worker's port and recycles the operation
+        //! once the worker acknowledges it. The coordinator owns the stop order, which is the
+        //! baseline's: close admission and join the acceptor first, then publish the
+        //! admission-closed barrier plus stop to every worker, join them, then report.
 
-    use core::ptr;
-    use core::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread::{self, JoinHandle};
-    use std::time::Duration;
+        use core::ptr;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, OnceLock};
+        use std::thread::{self, JoinHandle};
+        use std::time::Duration;
 
-    use windows::Win32::mswsock::LPFN_ACCEPTEX;
-    use windows::Win32::winsock2::INVALID_SOCKET;
+        use windows::Win32::mswsock::{LPFN_ACCEPTEX, LPFN_GETACCEPTEXSOCKADDRS};
+        use windows::Win32::winsock2::INVALID_SOCKET;
 
-    use crate::acceptor::{AcceptAction, AcceptState, AcceptTable, AcceptorCore};
-    use crate::native::arena::tcp_stride;
-    use crate::contract::{accept_operation_count, tcp_connection_capacity};
-    use crate::native::endpoint::{bind_endpoint, listen_endpoint, update_accept_context};
-    use crate::native::{
-        active_processor_count, configure_socket, fail_fast, load_accept_ex, now_milliseconds, report,
-        registered_socket, HandleOwner, RioFunctions, SendHandle, SocketOwner,
-    };
-    use crate::native::rio::{get_queued_completion_status, post_completion, CompletionPort};
-    use crate::types::{
-        resolved_worker_count, ExitCode, Options, Protocol, Statistics, ACCEPTS_PER_WORKER,
-        ACCEPT_ADDRESS_BYTES, ADMISSION_CLOSED_KEY, ERROR_INVALID_DATA, ERROR_IO_PENDING,
-        ERROR_NOT_ENOUGH_MEMORY, MAXIMUM_ACCEPTS, STOP_KEY, WAIT_TIMEOUT,
-    };
-    use crate::worker::{TcpWorker, WorkerReport};
+        use crate::acceptor::{
+            AcceptAction, AcceptState, AcceptTable, AcceptorCore, AdmissionCredits,
+            accept_error_is_recoverable,
+        };
+        use crate::contract::{
+            accept_operation_count, tcp_connection_capacity, worker_memory_budget,
+        };
+        use crate::native::arena::tcp_stride;
+        use crate::native::endpoint::{bind_endpoint, listen_endpoint, update_accept_context};
+        use crate::native::rio::{CompletionPort, get_queued_completion_status, post_completion};
+        use crate::native::{
+            HandleOwner, RioFunctions, SendHandle, SocketOwner, active_processor_count,
+            configure_socket, fail_fast, load_accept_addresses, load_accept_ex, now_milliseconds,
+            registered_socket, report,
+        };
+        use crate::types::{
+            ACCEPT_ADDRESS_BYTES, ADMISSION_CLOSED_KEY, ERROR_INVALID_DATA, ERROR_IO_PENDING,
+            ERROR_NOT_ENOUGH_MEMORY, ExitCode, Options, Protocol, STOP_KEY, Statistics,
+            WAIT_TIMEOUT, resolved_worker_count,
+        };
+        use crate::worker::{TcpWorker, WorkerReport};
 
-    /// How a handoff ended: posted to a worker, withdrawn because the acceptor closed the
-    /// socket first, or failed for a reason admission cannot continue from.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum HandoffOutcome {
-        Posted,
-        Withdrawn,
-        Failed,
-    }
+        /// How a handoff ended: posted to a worker, withdrawn because the acceptor closed the
+        /// socket first, or failed for a reason admission cannot continue from.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum HandoffOutcome {
+            Posted,
+            Withdrawn,
+            Failed,
+            Rejected,
+        }
 
-    /// One worker's control surface: the port the acceptor hands sockets to and the join handle
-    /// the coordinator collects.
-    struct WorkerControl {
-        port: SendHandle,
-        join: JoinHandle<WorkerReport>,
-    }
+        /// One worker's control surface: the port the acceptor hands sockets to and the join handle
+        /// the coordinator collects.
+        struct WorkerControl {
+            port: SendHandle,
+            credits: Arc<AdmissionCredits>,
+            // The worker borrows this event when announcing readiness; keep its owner
+            // until the same thread has joined, including a readiness-wait failure.
+            _ready: HandleOwner,
+            join: JoinHandle<(TcpWorker, WorkerReport)>,
+        }
 
-    /// The acceptor runtime: listener, completion port, AcceptEx entry point and the
-    /// operation table the workers take their sockets from.
-    struct AcceptorRuntime {
-        core: AcceptorCore,
-        listener: SocketOwner,
-        port: CompletionPort,
-        accept_ex: LPFN_ACCEPTEX,
-        table: Arc<AcceptTable>,
-        operation_sockets: Box<[SocketOwner]>,
-        workers: Vec<SendHandle>,
-        socket_buffer_bytes: u32,
-        failure: Arc<AtomicBool>,
-    }
-
-    // SAFETY: the acceptor runtime is created on the coordinator thread and moved into the
-    // acceptor thread, which owns it until it returns. The only state two threads share is the
-    // operation table, whose socket field is atomic and whose ownership transfer is ordered by
-    // the IOCP packet pair (handoff, acknowledgement).
-    unsafe impl Send for AcceptorRuntime {}
-
-    impl AcceptorRuntime {
-        fn initialize(
-            options: &Options,
-            worker_count: u32,
+        /// The acceptor runtime: listener, completion port, AcceptEx entry point and the
+        /// operation table the workers take their sockets from.
+        struct AcceptorRuntime {
+            core: AcceptorCore,
+            listener: SocketOwner,
+            port: CompletionPort,
+            accept_ex: LPFN_ACCEPTEX,
+            get_accept_addresses: LPFN_GETACCEPTEXSOCKADDRS,
+            table: Arc<AcceptTable>,
+            operation_sockets: Box<[SocketOwner]>,
             workers: Vec<SendHandle>,
+            credits: Vec<Arc<AdmissionCredits>>,
+            socket_buffer_bytes: u32,
             failure: Arc<AtomicBool>,
-        ) -> Option<Self> {
-            let listener = match registered_socket(Protocol::Tcp) {
-                Ok(listener) => listener,
-                Err(error) => {
+            statistics: Statistics,
+        }
+
+        // SAFETY: the acceptor runtime is created on the coordinator thread and moved into the
+        // acceptor thread, which owns it until it returns. The only state two threads share is the
+        // operation table, whose socket field is atomic and whose ownership transfer is ordered by
+        // the IOCP packet pair (handoff, acknowledgement).
+        unsafe impl Send for AcceptorRuntime {}
+
+        impl AcceptorRuntime {
+            fn initialize(
+                options: &Options,
+                worker_count: u32,
+                workers: Vec<SendHandle>,
+                credits: Vec<Arc<AdmissionCredits>>,
+                failure: Arc<AtomicBool>,
+                startup_statistics: &mut Statistics,
+            ) -> Option<Self> {
+                let listener = match registered_socket(Protocol::Tcp) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        report(error.stage, error.code);
+                        startup_statistics.network_errors =
+                            startup_statistics.network_errors.wrapping_add(1);
+                        return None;
+                    }
+                };
+                let port = match CompletionPort::create() {
+                    Ok(port) => port,
+                    Err(error) => {
+                        report(error.stage, error.code);
+                        startup_statistics.network_errors =
+                            startup_statistics.network_errors.wrapping_add(1);
+                        return None;
+                    }
+                };
+                if let Err(error) =
+                    configure_socket(listener.raw(), true, options.socket_buffer_bytes)
+                {
                     report(error.stage, error.code);
+                    startup_statistics.network_errors =
+                        startup_statistics.network_errors.wrapping_add(1);
                     return None;
                 }
-            };
-            if let Err(error) = configure_socket(listener.raw(), true, options.socket_buffer_bytes) {
-                report(error.stage, error.code);
-                return None;
-            }
-            let port = match CompletionPort::create() {
-                Ok(port) => port,
-                Err(error) => {
+                if let Err(error) = bind_endpoint(listener.raw(), options.port) {
                     report(error.stage, error.code);
+                    startup_statistics.network_errors =
+                        startup_statistics.network_errors.wrapping_add(1);
                     return None;
                 }
-            };
-            if let Err(error) = bind_endpoint(listener.raw(), options.port) {
-                report(error.stage, error.code);
-                return None;
-            }
-            if let Err(error) = listen_endpoint(listener.raw()) {
-                report(error.stage, error.code);
-                return None;
-            }
-            if let Err(error) = port.associate_socket(listener.raw()) {
-                report(error.stage, error.code);
-                return None;
-            }
-            let accept_ex = match load_accept_ex(listener.raw()) {
-                Ok(accept_ex) => accept_ex,
-                Err(error) => {
+                if let Err(error) = listen_endpoint(listener.raw()) {
                     report(error.stage, error.code);
+                    startup_statistics.network_errors =
+                        startup_statistics.network_errors.wrapping_add(1);
                     return None;
                 }
-            };
-            let operation_count =
-                accept_operation_count(worker_count, ACCEPTS_PER_WORKER, MAXIMUM_ACCEPTS);
-            if operation_count == 0 {
-                report("AcceptEx operation count", ERROR_NOT_ENOUGH_MEMORY);
-                return None;
-            }
-            let table = Arc::new(AcceptTable::new(operation_count, SendHandle(port.raw())));
-            let operation_sockets: Box<[SocketOwner]> = (0..operation_count)
-                .map(|_| SocketOwner::new(INVALID_SOCKET))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            Some(Self {
-                core: AcceptorCore::new(operation_count, worker_count),
-                listener,
-                port,
-                accept_ex,
-                table,
-                operation_sockets,
-                workers,
-                socket_buffer_bytes: options.socket_buffer_bytes,
-                failure,
-            })
-        }
-
-        fn table(&self) -> Arc<AcceptTable> {
-            Arc::clone(&self.table)
-        }
-
-        fn port_handle(&self) -> SendHandle {
-            SendHandle(self.port.raw())
-        }
-
-        /// Closes whatever socket the slot currently owns, in either owner: the acceptor's own
-        /// slot while the operation is posted, or the table mirror once it was transferred for
-        /// a handoff.
-        fn close_accept_socket(&mut self, index: u32) {
-            // The socket is owned by exactly one of the two places: the acceptor's own slot while the
-            // operation is posted, or the table mirror once it was transferred for a handoff. Closing both
-            // closed one value twice, and Windows is free to hand a closed value to another socket in
-            // between. The slot therefore hands its value over with release(), which does not close it, and
-            // the single owner is closed once below.
-            let slot_raw = self.operation_sockets[index as usize].raw();
-            let _ = self.operation_sockets[index as usize].release();
-            let raw = self.table.clear_socket(index).unwrap_or(slot_raw);
-            if raw != INVALID_SOCKET {
-                let mut owner = SocketOwner::new(raw);
-                owner.reset();
-            }
-        }
-
-        /// Posts an AcceptEx on one operation slot with a fresh registered socket.
-        fn post_accept(&mut self, index: u32) -> bool {
-            let overlapped = self.table.overlapped_ptr(index);
-            if overlapped.is_null() || self.table.address_ptr(index).is_null() {
-                report("AcceptEx operation table", ERROR_INVALID_DATA);
-                return false;
-            }
-            unsafe {
-                *overlapped = windows::Win32::minwinbase::OVERLAPPED::default();
-            }
-            let socket = match registered_socket(Protocol::Tcp) {
-                Ok(socket) => socket,
-                Err(error) => {
+                if let Err(error) = port.associate_socket(listener.raw()) {
                     report(error.stage, error.code);
+                    startup_statistics.network_errors =
+                        startup_statistics.network_errors.wrapping_add(1);
+                    return None;
+                }
+                let accept_ex = match load_accept_ex(listener.raw()) {
+                    Ok(accept_ex) => accept_ex,
+                    Err(error) => {
+                        report(error.stage, error.code);
+                        startup_statistics.network_errors =
+                            startup_statistics.network_errors.wrapping_add(1);
+                        return None;
+                    }
+                };
+                let get_accept_addresses = match load_accept_addresses(listener.raw()) {
+                    Ok(function) => function,
+                    Err(error) => {
+                        report(error.stage, error.code);
+                        startup_statistics.network_errors =
+                            startup_statistics.network_errors.wrapping_add(1);
+                        return None;
+                    }
+                };
+                let operation_count = accept_operation_count(worker_count);
+                if operation_count == 0 {
+                    report("AcceptEx operation count", ERROR_NOT_ENOUGH_MEMORY);
+                    return None;
+                }
+                let table = Arc::new(AcceptTable::new(operation_count, SendHandle(port.raw())));
+                let operation_sockets: Box<[SocketOwner]> = (0..operation_count)
+                    .map(|_| SocketOwner::new(INVALID_SOCKET))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                Some(Self {
+                    core: AcceptorCore::new(operation_count, worker_count),
+                    listener,
+                    port,
+                    accept_ex,
+                    get_accept_addresses,
+                    table,
+                    operation_sockets,
+                    workers,
+                    credits,
+                    socket_buffer_bytes: options.socket_buffer_bytes,
+                    failure,
+                    statistics: Statistics::default(),
+                })
+            }
+
+            fn table(&self) -> Arc<AcceptTable> {
+                Arc::clone(&self.table)
+            }
+
+            fn port_handle(&self) -> SendHandle {
+                SendHandle(self.port.raw())
+            }
+
+            /// Closes whatever socket the slot currently owns, in either owner: the acceptor's own
+            /// slot while the operation is posted, or the table mirror once it was transferred for
+            /// a handoff.
+            fn close_accept_socket(&mut self, index: u32) {
+                // The socket is owned by exactly one of the two places: the acceptor's own slot while the
+                // operation is posted, or the table mirror once it was transferred for a handoff. Closing both
+                // closed one value twice, and Windows is free to hand a closed value to another socket in
+                // between. The slot therefore hands its value over with release(), which does not close it, and
+                // the single owner is closed once below.
+                let slot_raw = self.operation_sockets[index as usize].raw();
+                let _ = self.operation_sockets[index as usize].release();
+                let raw = self.table.clear_socket(index).unwrap_or(slot_raw);
+                if raw != INVALID_SOCKET {
+                    let mut owner = SocketOwner::new(raw);
+                    owner.reset();
+                }
+            }
+
+            /// Posts an AcceptEx on one operation slot with a fresh registered socket.
+            fn post_accept(&mut self, index: u32) -> bool {
+                let overlapped = self.table.overlapped_ptr(index);
+                if overlapped.is_null() || self.table.address_ptr(index).is_null() {
+                    report("AcceptEx operation table", ERROR_INVALID_DATA);
                     return false;
                 }
-            };
-            let raw = socket.raw();
-            self.operation_sockets[index as usize] = socket;
-            self.table.store_socket(index, raw);
-            let Some(accept_ex) = self.accept_ex else {
-                report("AcceptEx entry point", ERROR_INVALID_DATA);
-                self.close_accept_socket(index);
-                return false;
-            };
-            let mut received: u32 = 0;
-            let accepted = unsafe {
-                accept_ex(
-                    self.listener.raw(),
-                    raw,
-                    self.table.address_ptr(index),
-                    0,
-                    ACCEPT_ADDRESS_BYTES as u32,
-                    ACCEPT_ADDRESS_BYTES as u32,
-                    &mut received,
-                    overlapped,
-                )
-            };
-            if !accepted.as_bool() {
-                let error = unsafe { windows::Win32::winsock2::WSAGetLastError() };
-                if error != ERROR_IO_PENDING {
+                if self.core.state(index) != Some(AcceptState::Idle)
+                    || self.operation_sockets[index as usize].raw() != INVALID_SOCKET
+                {
+                    fail_fast("AcceptEx repost precondition", 5023);
+                }
+                for _ in 0..4 {
+                    if self.core.stopping
+                        || self.failure.load(Ordering::Acquire)
+                        || self.listener.raw() == INVALID_SOCKET
+                    {
+                        return true;
+                    }
+                    unsafe {
+                        *overlapped = windows::Win32::minwinbase::OVERLAPPED::default();
+                    }
+                    let socket = match registered_socket(Protocol::Tcp) {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            report(error.stage, error.code);
+                            self.statistics.network_errors =
+                                self.statistics.network_errors.wrapping_add(1);
+                            return false;
+                        }
+                    };
+                    let raw = socket.raw();
+                    self.operation_sockets[index as usize] = socket;
+                    self.table.store_socket(index, raw);
+                    let Some(accept_ex) = self.accept_ex else {
+                        fail_fast("AcceptEx entry point", ERROR_INVALID_DATA);
+                    };
+                    let mut received: u32 = 0;
+                    self.core.mark_posted(index);
+                    let accepted = unsafe {
+                        accept_ex(
+                            self.listener.raw(),
+                            raw,
+                            self.table.address_ptr(index),
+                            0,
+                            ACCEPT_ADDRESS_BYTES as u32,
+                            ACCEPT_ADDRESS_BYTES as u32,
+                            &mut received,
+                            overlapped,
+                        )
+                    };
+                    if accepted.as_bool() {
+                        return true;
+                    }
+                    let error = unsafe { windows::Win32::winsock2::WSAGetLastError() };
+                    if error == ERROR_IO_PENDING {
+                        return true;
+                    }
+                    self.core.abort_handoff(index);
+                    self.close_accept_socket(index);
+                    self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
+                    if accept_error_is_recoverable(error as u32) {
+                        continue;
+                    }
                     report("AcceptEx", error);
-                    self.close_accept_socket(index);
                     return false;
                 }
+                self.core.defer_repost(index);
+                let key = overlapped as usize;
+                if let Err(error) = post_completion(self.port.raw(), key, ptr::null_mut()) {
+                    fail_fast(
+                        "PostQueuedCompletionStatus(deferred AcceptEx repost)",
+                        error.code,
+                    );
+                }
+                true
             }
-            self.core.mark_posted(index);
-            true
+
+            /// Stops admission, closes the listener and unposts every operation that is still
+            /// waiting; handoffs already in transit are awaited by the loop condition.
+            fn stop_admission(&mut self) {
+                self.core.stop();
+                self.listener.reset();
+                for index in 0..self.core.operation_count() {
+                    if self.core.state(index) == Some(AcceptState::Posted) {
+                        self.close_accept_socket(index);
+                    }
+                }
+            }
+
+            fn fail_admission(&mut self, stage: &str, error: i32) {
+                report(stage, error);
+                self.failure.store(true, Ordering::Release);
+                self.stop_admission();
+            }
         }
 
-        /// Stops admission, closes the listener and unposts every operation that is still
-        /// waiting; handoffs already in transit are awaited by the loop condition.
-        fn stop_admission(&mut self) {
-            self.core.stop();
-            self.listener.reset();
-            for index in 0..self.core.operation_count() {
-                if self.core.state(index) == Some(AcceptState::Posted) {
+        impl Drop for AcceptorRuntime {
+            fn drop(&mut self) {
+                if self.core.has_live() {
+                    fail_fast("acceptor release with live operations", 996);
+                }
+                for index in 0..self.core.operation_count() {
                     self.close_accept_socket(index);
                 }
             }
         }
 
-        fn fail_admission(&mut self, stage: &str, error: i32) {
-            report(stage, error);
-            self.failure.store(true, Ordering::Release);
-            self.stop_admission();
-        }
-    }
+        /// Runs the TCP server until the stop flag is set, a run deadline passes or admission
+        /// fails, then reports the aggregated statistics.
+        ///
+        /// Stop order (the baseline's): close admission and join the acceptor, publish the
+        /// admission-closed barrier plus stop to every worker, join them, aggregate, report.
+        pub fn run_tcp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> ExitCode {
+            let worker_count =
+                resolved_worker_count(options.worker_count, active_processor_count());
+            let failure = Arc::new(AtomicBool::new(false));
+            let stride = tcp_stride(options.rio_buffer_bytes);
+            let page = crate::native::page_bytes();
+            let timeout_milliseconds = u64::from(options.timeout_seconds) * 1_000;
+            // Idle workers do not need the table. Publish it once all workers have
+            // announced readiness, before the acceptor can issue the first handoff.
+            let table: Arc<OnceLock<Arc<AcceptTable>>> = Arc::new(OnceLock::new());
+            let mut controls: Vec<WorkerControl> = Vec::with_capacity(worker_count as usize);
 
-
-    /// Runs the TCP server until the stop flag is set, a run deadline passes or admission
-    /// fails, then reports the aggregated statistics.
-    ///
-    /// Stop order (the baseline's): close admission and join the acceptor, publish the
-    /// admission-closed barrier plus stop to every worker, join them, aggregate, report.
-    pub fn run_tcp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> ExitCode {
-        let worker_count = resolved_worker_count(options.worker_count, active_processor_count());
-        let failure = Arc::new(AtomicBool::new(false));
-        let stride = tcp_stride(options.rio_buffer_bytes);
-        let memory_share = options.memory_bytes / u64::from(worker_count);
-        let possible_slots = if stride == 0 { 0 } else { memory_share / u64::from(stride) };
-        let slot_count = tcp_connection_capacity(options.cq_capacity, possible_slots);
-        if possible_slots == 0 || slot_count == 0 {
-            report("worker registered arena capacity", ERROR_NOT_ENOUGH_MEMORY);
-            return ExitCode::Network;
-        }
-        let timeout_milliseconds = u64::from(options.timeout_seconds) * 1_000;
-
-        // Workers first: their completion ports are what the acceptor hands sockets to.
-        let mut workers: Vec<TcpWorker> = Vec::with_capacity(worker_count as usize);
-        let mut ready_events: Vec<HandleOwner> = Vec::with_capacity(worker_count as usize);
-        let mut created = 0u32;
-        while created < worker_count {
-            let ready = HandleOwner::new(unsafe {
-                windows::Win32::synchapi::CreateEventW(None, true, false, None)
-            });
-            if !ready.is_open() {
-                // The failure code is captured here: a later Win32 call would overwrite it.
-                let error = crate::native::NativeError::last("CreateEvent(worker ready)");
-                report(error.stage, error.code);
-                failure.store(true, Ordering::Release);
-                break;
-            }
-            match TcpWorker::create(
-                rio,
-                created,
-                slot_count,
-                stride,
-                options.cq_capacity,
-                memory_share,
-                timeout_milliseconds,
-                Arc::clone(&failure),
-            ) {
-                Ok(mut worker) => {
-                    worker.mark_running();
-                    workers.push(worker);
-                    ready_events.push(ready);
-                    created += 1;
+            // Initialize, start and wait for each worker before creating the next one.
+            // A later failure still stops and joins every thread that already started.
+            for index in 0..worker_count {
+                let memory_share =
+                    worker_memory_budget(options.memory_bytes, worker_count, index, page);
+                let possible_slots = if stride == 0 {
+                    0
+                } else {
+                    memory_share / u64::from(stride)
+                };
+                let slot_count = tcp_connection_capacity(options.cq_capacity, possible_slots);
+                if possible_slots == 0 || slot_count == 0 {
+                    report("worker registered arena capacity", ERROR_NOT_ENOUGH_MEMORY);
+                    failure.store(true, Ordering::Release);
+                    break;
                 }
-                Err(error) => {
+                let ready = HandleOwner::new(unsafe {
+                    windows::Win32::synchapi::CreateEventW(None, true, false, None)
+                });
+                if !ready.is_open() {
+                    // The failure code is captured here: a later Win32 call would overwrite it.
+                    let error = crate::native::NativeError::last("CreateEvent(worker ready)");
                     report(error.stage, error.code);
                     failure.store(true, Ordering::Release);
                     break;
                 }
-            }
-        }
-
-        // Admission opens only when every worker exists.
-        let mut acceptor = None;
-        if !failure.load(Ordering::Acquire) {
-            let ports: Vec<SendHandle> = workers.iter().map(TcpWorker::port_handle).collect();
-            match AcceptorRuntime::initialize(options, created, ports, Arc::clone(&failure)) {
-                Some(runtime) => acceptor = Some(runtime),
-                None => failure.store(true, Ordering::Release),
-            }
-        }
-        if acceptor.is_none() {
-            // No thread was started, so the workers are released without ever running.
-            for worker in workers {
-                worker.destroy();
-            }
-            return ExitCode::Network;
-        }
-        let Some(mut acceptor_runtime) = acceptor.take() else {
-            for worker in workers {
-                worker.destroy();
-            }
-            return ExitCode::Network;
-        };
-        let table = acceptor_runtime.table();
-        let acceptor_port = acceptor_runtime.port_handle();
-
-        // Worker threads: each owns its worker, and the table it needs for a handoff.
-        let mut controls: Vec<WorkerControl> = Vec::with_capacity(workers.len());
-        for (index, worker) in workers.into_iter().enumerate() {
-            let ready = SendHandle(ready_events[index].raw());
-            let stop_clone = Arc::clone(stop);
-            let table_clone = Arc::clone(&table);
-            let port = worker.port_handle();
-            let join = thread::spawn(move || {
-                let mut worker = worker;
-                let report = worker.run(&stop_clone, &table_clone, ready);
-                // The thread owns the worker, so the release happens here and not in the
-                // coordinator: RIO must not be touched after the owning thread ended.
-                worker.destroy();
-                report
-            });
-            controls.push(WorkerControl { port, join });
-        }
-        for event in &ready_events {
-            let status = unsafe { windows::Win32::synchapi::WaitForSingleObject(event.raw(), u32::MAX) };
-            if status != crate::types::WAIT_OBJECT_0 {
-                report("worker startup readiness", ERROR_INVALID_DATA);
-                failure.store(true, Ordering::Release);
-            }
-        }
-
-        let acceptor_join = thread::spawn(move || acceptor_runtime.run());
-
-        let start = now_milliseconds();
-        while !failure.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
-            if options.run_seconds != 0
-                && now_milliseconds().saturating_sub(start) >= u64::from(options.run_seconds) * 1_000
-            {
-                stop.store(true, Ordering::Release);
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        if let Err(error) = post_completion(acceptor_port.0, STOP_KEY, ptr::null_mut()) {
-            fail_fast("PostQueuedCompletionStatus(acceptor stop)", error.code);
-        }
-        if acceptor_join.join().is_err() {
-            // A panicking acceptor thread still has to fail the run: the workers below must
-            // not be told that admission closed normally.
-            failure.store(true, Ordering::Release);
-        }
-        for control in &controls {
-            if let Err(error) = post_completion(control.port.0, ADMISSION_CLOSED_KEY, ptr::null_mut()) {
-                fail_fast("PostQueuedCompletionStatus(worker admission closed)", error.code);
-            }
-            if let Err(error) = post_completion(control.port.0, STOP_KEY, ptr::null_mut()) {
-                fail_fast("PostQueuedCompletionStatus(worker stop)", error.code);
-            }
-        }
-
-        let mut statistics = Statistics::default();
-        for control in controls {
-            match control.join.join() {
-                Ok(report) => {
-                    statistics.merge(&report.statistics);
-                    if options.stats {
-                        println!("{}", report.statistics.worker_line(report.index, report.active));
+                let mut worker = match TcpWorker::create(
+                    rio,
+                    index,
+                    slot_count,
+                    stride,
+                    options.cq_capacity,
+                    memory_share,
+                    timeout_milliseconds,
+                    Arc::clone(&failure),
+                ) {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        report(error.stage, error.code);
+                        failure.store(true, Ordering::Release);
+                        break;
+                    }
+                };
+                worker.mark_running();
+                let ready_handle = SendHandle(ready.raw());
+                let stop_clone = Arc::clone(stop);
+                let table_clone = Arc::clone(&table);
+                let port = worker.port_handle();
+                let credits = worker.admission_credits();
+                let join = thread::Builder::new().spawn(move || {
+                    let mut worker = worker;
+                    let report = worker.run(&stop_clone, &table_clone, ready_handle);
+                    // Return ownership, keeping the port and notification storage alive until
+                    // the coordinator has finished publishing control packets and joined us.
+                    (worker, report)
+                });
+                match join {
+                    Ok(join) => controls.push(WorkerControl {
+                        port,
+                        credits,
+                        _ready: ready,
+                        join,
+                    }),
+                    Err(error) => {
+                        report(
+                            "CreateThread(worker)",
+                            error.raw_os_error().unwrap_or(ERROR_NOT_ENOUGH_MEMORY),
+                        );
+                        failure.store(true, Ordering::Release);
+                        break;
                     }
                 }
-                Err(_) => failure.store(true, Ordering::Release),
+                let status = unsafe {
+                    windows::Win32::synchapi::WaitForSingleObject(ready_handle.0, u32::MAX)
+                };
+                if status != crate::types::WAIT_OBJECT_0 {
+                    report("worker startup readiness", ERROR_INVALID_DATA);
+                    failure.store(true, Ordering::Release);
+                    break;
+                }
             }
-        }
-        if options.stats {
-            println!(
-                "{}",
-                statistics.final_line(
-                    Protocol::Tcp,
-                    now_milliseconds().saturating_sub(start),
+
+            // Admission opens only after every requested worker is ready. A missing
+            // acceptor is an ordinary startup failure, with the same worker cleanup below.
+            // Store its control handle only together with a successfully started owner.
+            let mut acceptor_control = None;
+            let mut startup_statistics = Statistics::default();
+            if !failure.load(Ordering::Acquire) {
+                let ports = controls.iter().map(|control| control.port).collect();
+                let credits = controls
+                    .iter()
+                    .map(|control| Arc::clone(&control.credits))
+                    .collect();
+                match AcceptorRuntime::initialize(
+                    options,
                     worker_count,
-                    0
-                )
-            );
-        }
-        if failure.load(Ordering::Acquire) { ExitCode::Network } else { ExitCode::Success }
-    }
+                    ports,
+                    credits,
+                    Arc::clone(&failure),
+                    &mut startup_statistics,
+                ) {
+                    Some(mut runtime) => {
+                        if table.set(runtime.table()).is_err() {
+                            fail_fast("server accept table publication", ERROR_INVALID_DATA);
+                        }
+                        let port = runtime.port_handle();
+                        match thread::Builder::new().spawn(move || {
+                            runtime.run();
+                            // Keep the port and operation table alive until the coordinator
+                            // has published stop and joined the acceptor.
+                            runtime
+                        }) {
+                            Ok(join) => acceptor_control = Some((port, join)),
+                            Err(error) => {
+                                report(
+                                    "CreateThread(acceptor)",
+                                    error.raw_os_error().unwrap_or(ERROR_NOT_ENOUGH_MEMORY),
+                                );
+                                failure.store(true, Ordering::Release);
+                            }
+                        }
+                    }
+                    None => failure.store(true, Ordering::Release),
+                }
+            }
 
-    impl AcceptorRuntime {
-        /// Runs the acceptor loop until it stops and every operation has been recycled.
-        fn run(&mut self) {
-            for index in self.core.initial_posts() {
-                if !self.post_accept(index) {
-                    self.fail_admission("AcceptEx(initial)", ERROR_INVALID_DATA);
+            let start = now_milliseconds();
+            while !failure.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+                if options.run_seconds != 0
+                    && now_milliseconds().saturating_sub(start)
+                        >= u64::from(options.run_seconds) * 1_000
+                {
+                    stop.store(true, Ordering::Release);
                     break;
                 }
+                thread::sleep(Duration::from_millis(10));
             }
-            while !self.core.stopping || self.core.has_live() {
-                let packet = get_queued_completion_status(self.port.raw(), 100);
-                if packet.overlapped.is_null() && packet.key == STOP_KEY {
-                    self.stop_admission();
-                    continue;
-                }
-                if packet.overlapped.is_null() && packet.key > STOP_KEY {
-                    let Some(operation) = self.table.find(packet.key) else {
-                        fail_fast("server accept acknowledgement identity", ERROR_INVALID_DATA);
-                    };
-                    let index = operation.index;
-                    // The worker adopts or closes the socket before acknowledging; anything
-                    // still attached here is a stray the acceptor reclaims.
-                    if let Some(stray) = self.table.clear_socket(index) {
-                        if stray != INVALID_SOCKET {
-                            let mut owner = SocketOwner::new(stray);
-                            owner.reset();
-                        }
-                    }
-                    match self.core.on_ack(index) {
-                        AcceptAction::Repost { index } => {
-                            if !self.post_accept(index) {
-                                self.fail_admission("AcceptEx(repost)", ERROR_INVALID_DATA);
-                            }
-                        }
-                        AcceptAction::None => {}
-                        _ => fail_fast("server accept acknowledgement state", ERROR_INVALID_DATA),
-                    }
-                    continue;
-                }
-                if !packet.overlapped.is_null() {
-                    let Some(operation) = self.table.find(packet.overlapped as usize) else {
-                        fail_fast("server AcceptEx completion identity", ERROR_INVALID_DATA);
-                    };
-                    let index = operation.index;
-                    if self.table.overlapped_ptr(index) != packet.overlapped {
-                        fail_fast("server AcceptEx completion identity", ERROR_INVALID_DATA);
-                    }
-                    match self.core.on_completion(index, packet.succeeded, packet.error) {
-                        AcceptAction::Repost { index } => {
-                            if !self.post_accept(index) {
-                                self.fail_admission("AcceptEx(repost after reset)", ERROR_INVALID_DATA);
-                            }
-                        }
-                        AcceptAction::Handoff { index, worker } => match self.handoff(index, worker) {
-                            HandoffOutcome::Posted => {}
-                            HandoffOutcome::Withdrawn => {
-                                // The acceptor closed this socket while unposting (a stop raced
-                                // the completion); the slot goes back to idle and admission
-                                // stays healthy unless it was not stopping.
-                                self.core.abort_handoff(index);
-                                if !self.core.stopping {
-                                    self.fail_admission("AcceptEx handoff withdrawn", ERROR_INVALID_DATA);
-                                }
-                            }
-                            HandoffOutcome::Failed => {
-                                self.core.abort_handoff(index);
-                                self.fail_admission("AcceptEx handoff", ERROR_INVALID_DATA);
-                            }
-                        },
-                        AcceptAction::Fatal { error, .. } => {
-                            self.fail_admission("AcceptEx completion", error as i32);
-                        }
-                        AcceptAction::None => {}
-                    }
-                    continue;
-                }
-                if !packet.succeeded && packet.error != WAIT_TIMEOUT {
-                    self.fail_admission("GetQueuedCompletionStatus(acceptor)", packet.error as i32);
-                }
-            }
-        }
 
-        /// Applies the accept context, transfers the socket to the worker and posts the
-        /// handoff. Ownership leaves this thread with the transfer.
-        fn handoff(&mut self, index: u32, worker: u32) -> HandoffOutcome {
-            let socket = self.operation_sockets[index as usize].release();
-            if socket == INVALID_SOCKET {
-                // The socket is gone because the acceptor closed it while unposting; a stop
-                // that raced a successful completion lands here.
-                return HandoffOutcome::Withdrawn;
-            }
-            self.table.store_socket(index, socket);
-            if let Err(error) = update_accept_context(socket, self.listener.raw()) {
-                report(error.stage, error.code);
-                self.close_accept_socket(index);
-                return HandoffOutcome::Failed;
-            }
-            if let Err(error) = configure_socket(socket, true, self.socket_buffer_bytes) {
-                report(error.stage, error.code);
-                self.close_accept_socket(index);
-                return HandoffOutcome::Failed;
-            }
-            let Some(target) = self.workers.get(worker as usize).copied() else {
-                report("server acceptor worker table", ERROR_INVALID_DATA);
-                self.close_accept_socket(index);
-                return HandoffOutcome::Failed;
+            let mut statistics = if let Some((port, join)) = acceptor_control {
+                if let Err(error) = post_completion(port.0, STOP_KEY, ptr::null_mut()) {
+                    fail_fast("PostQueuedCompletionStatus(acceptor stop)", error.code);
+                }
+                match join.join() {
+                    Ok(runtime) => runtime.statistics,
+                    Err(_) => {
+                        failure.store(true, Ordering::Release);
+                        startup_statistics
+                    }
+                }
+            } else {
+                // Listener, bind/listen, IOCP and extension-loading failures are acceptor
+                // network errors even when no acceptor thread was started.
+                startup_statistics
             };
-            let Some(key) = self
-                .table
-                .operation(index)
-                .map(|operation| operation as *const crate::acceptor::AcceptOperation as usize)
-            else {
-                report("server accept handoff identity", ERROR_INVALID_DATA);
-                self.close_accept_socket(index);
-                return HandoffOutcome::Failed;
-            };
-            if let Err(error) = post_completion(target.0, key, ptr::null_mut()) {
-                report(error.stage, error.code);
-                self.close_accept_socket(index);
-                return HandoffOutcome::Failed;
-            }
-            HandoffOutcome::Posted
-        }
-    }
-}
-
-pub mod timer {
-    //! Worker-private index minimum heap over connection deadlines.
-    //!
-    //! Only the owning thread touches it, so no synchronisation is needed. The heap keeps a
-    //! position map so a connection's deadline can be updated or removed in place, and its
-    //! capacity is fixed for the whole run: it never grows past the worker's slot count.
-    //!
-    //! This is the same structure as ces_timer_heap in the C++ baseline and CESTimerHeap in
-    //! the Swift port, including the order rule (deadline, then index) and the wait rule
-    //! (INFINITE when empty, saturated one below INFINITE otherwise).
-
-    use crate::types::{TimerNode, INFINITE};
-
-    #[derive(Debug)]
-    pub struct TimerHeap {
-        capacity: usize,
-        size: usize,
-        nodes: Vec<TimerNode>,
-        /// Position of a connection inside `nodes`, or -1 when it has no deadline.
-        positions: Vec<i32>,
-    }
-
-    impl TimerHeap {
-        pub fn new(capacity: usize) -> Self {
-            Self {
-                capacity,
-                size: 0,
-                nodes: vec![TimerNode::default(); capacity],
-                positions: vec![-1; capacity],
-            }
-        }
-
-        pub fn capacity(&self) -> usize {
-            self.capacity
-        }
-
-        pub fn len(&self) -> usize {
-            self.size
-        }
-
-        pub fn is_empty(&self) -> bool {
-            self.size == 0
-        }
-
-        pub fn contains(&self, connection_index: u32) -> bool {
-            (connection_index as usize) < self.capacity && self.positions[connection_index as usize] >= 0
-        }
-
-        pub fn next_deadline(&self) -> Option<u64> {
-            if self.size == 0 { None } else { Some(self.nodes[0].deadline) }
-        }
-
-        /// Position of a connection inside the heap, as the reference model reads it.
-        pub fn position_of(&self, connection_index: u32) -> Option<usize> {
-            if (connection_index as usize) >= self.capacity {
-                return None;
-            }
-            let position = self.positions[connection_index as usize];
-            if position < 0 { None } else { Some(position as usize) }
-        }
-
-        fn less(&self, a: usize, b: usize) -> bool {
-            let left = self.nodes[a];
-            let right = self.nodes[b];
-            (left.deadline, left.connection_index) < (right.deadline, right.connection_index)
-        }
-
-        fn swap(&mut self, a: usize, b: usize) {
-            self.nodes.swap(a, b);
-            let left = self.nodes[a].connection_index as usize;
-            let right = self.nodes[b].connection_index as usize;
-            self.positions[left] = a as i32;
-            self.positions[right] = b as i32;
-        }
-
-        fn sift_up(&mut self, mut index: usize) {
-            while index > 0 {
-                let parent = (index - 1) / 2;
-                if !self.less(index, parent) {
-                    break;
+            for control in &controls {
+                if let Err(error) =
+                    post_completion(control.port.0, ADMISSION_CLOSED_KEY, ptr::null_mut())
+                {
+                    fail_fast(
+                        "PostQueuedCompletionStatus(worker admission closed)",
+                        error.code,
+                    );
                 }
-                self.swap(index, parent);
-                index = parent;
+                if let Err(error) = post_completion(control.port.0, STOP_KEY, ptr::null_mut()) {
+                    fail_fast("PostQueuedCompletionStatus(worker stop)", error.code);
+                }
+            }
+
+            let mut snapshots = Vec::with_capacity(controls.len());
+            let started_workers = controls.len() as u32;
+            for control in controls {
+                match control.join.join() {
+                    Ok((worker, report)) => {
+                        statistics.merge(&report.statistics);
+                        snapshots.push(report.notification);
+                        worker.destroy();
+                    }
+                    Err(_) => failure.store(true, Ordering::Release),
+                }
+            }
+            crate::native::write_diagnostics(&snapshots, Protocol::Tcp);
+            if options.stats {
+                println!(
+                    "{}",
+                    statistics.final_line(
+                        Protocol::Tcp,
+                        now_milliseconds().saturating_sub(start),
+                        started_workers,
+                        0
+                    )
+                );
+            }
+            if failure.load(Ordering::Acquire) {
+                ExitCode::Network
+            } else {
+                ExitCode::Success
             }
         }
 
-        fn sift_down(&mut self, mut index: usize) {
-            loop {
-                let left = index * 2 + 1;
-                if left >= self.size {
-                    break;
-                }
-                let right = left + 1;
-                let smallest = if right < self.size && self.less(right, left) { right } else { left };
-                if !self.less(smallest, index) {
-                    break;
-                }
-                self.swap(index, smallest);
-                index = smallest;
-            }
-        }
-
-        /// Schedules or reschedules a connection. Returns false when the index is outside the
-        /// fixed capacity or the heap is full: the caller must treat that as a hard failure
-        /// instead of silently dropping a deadline.
-        pub fn insert_or_update(&mut self, deadline: u64, connection_index: u32) -> bool {
-            let slot = connection_index as usize;
-            if slot >= self.capacity {
-                return false;
-            }
-            let existing = self.positions[slot];
-            if existing >= 0 {
-                let position = existing as usize;
-                let previous = self.nodes[position].deadline;
-                if deadline == previous {
-                    return true;
-                }
-                self.nodes[position].deadline = deadline;
-                if deadline < previous {
-                    self.sift_up(position);
-                } else {
-                    self.sift_down(position);
-                }
-                return true;
-            }
-            if self.size == self.capacity {
-                return false;
-            }
-            let position = self.size;
-            self.size += 1;
-            self.nodes[position] = TimerNode { deadline, connection_index };
-            self.positions[slot] = position as i32;
-            self.sift_up(position);
-            true
-        }
-
-        /// Drops a connection's deadline. Removing an unscheduled connection is not an error.
-        pub fn remove(&mut self, connection_index: u32) -> bool {
-            let slot = connection_index as usize;
-            if slot >= self.capacity {
-                return false;
-            }
-            let position = self.positions[slot];
-            if position < 0 {
-                return false;
-            }
-            let position = position as usize;
-            self.positions[slot] = -1;
-            let last = self.size - 1;
-            self.size = last;
-            if position != last {
-                self.nodes[position] = self.nodes[last];
-                self.positions[self.nodes[position].connection_index as usize] = position as i32;
-                let parent = if position > 0 { Some((position - 1) / 2) } else { None };
-                if let Some(parent) = parent {
-                    if self.less(position, parent) {
-                        self.sift_up(position);
-                        return true;
+        impl AcceptorRuntime {
+            /// Runs the acceptor loop until it stops and every operation has been recycled.
+            fn run(&mut self) {
+                for index in self.core.initial_posts() {
+                    if !self.post_accept(index) {
+                        self.fail_admission("AcceptEx(initial)", ERROR_INVALID_DATA);
+                        break;
                     }
                 }
-                self.sift_down(position);
-            }
-            true
-        }
-
-        /// Wakes up only the connections whose deadline has passed. Each removed connection is
-        /// reported so the caller can close it.
-        pub fn pop_expired(&mut self, now: u64, out: &mut Vec<u32>) -> usize {
-            let mut count = 0;
-            while self.size > 0 && self.nodes[0].deadline <= now {
-                let node = self.nodes[0];
-                self.remove(node.connection_index);
-                out.push(node.connection_index);
-                count += 1;
-            }
-            count
-        }
-
-        /// Milliseconds to wait for the nearest deadline: INFINITE when nothing is scheduled,
-        /// zero when the nearest deadline has already passed, and otherwise one below INFINITE
-        /// at most so the value is always a usable timeout.
-        pub fn wait_milliseconds(&self, now: u64) -> u32 {
-            let Some(deadline) = self.next_deadline() else {
-                return INFINITE;
-            };
-            if deadline <= now {
-                return 0;
-            }
-            let remaining = deadline - now;
-            remaining.min(u64::from(INFINITE) - 1) as u32
-        }
-    }
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::types::WAIT_TIMEOUT;
-
-        fn xorshift(state: &mut u32) -> u32 {
-            let mut value = *state;
-            value ^= value << 13;
-            value ^= value >> 17;
-            value ^= value << 5;
-            *state = value;
-            value
-        }
-
-        #[test]
-        fn orders_by_deadline_then_index() {
-            let mut heap = TimerHeap::new(8);
-            assert!(heap.insert_or_update(30, 2));
-            assert!(heap.insert_or_update(10, 1));
-            assert!(heap.insert_or_update(20, 0));
-            assert_eq!(heap.next_deadline(), Some(10));
-            let mut expired = Vec::new();
-            assert_eq!(heap.pop_expired(25, &mut expired), 2);
-            assert_eq!(expired, vec![1, 0]);
-            assert_eq!(heap.next_deadline(), Some(30));
-            assert_eq!(heap.len(), 1);
-            // Equal deadlines are ordered by connection index.
-            let mut tied = TimerHeap::new(4);
-            assert!(tied.insert_or_update(50, 3));
-            assert!(tied.insert_or_update(50, 1));
-            let mut expired = Vec::new();
-            // Both deadlines passed at once; the pop order is by index.
-            assert_eq!(tied.pop_expired(50, &mut expired), 2);
-            assert_eq!(expired, vec![1, 3]);
-            // Nothing else was due before the deadline.
-            let mut early = TimerHeap::new(2);
-            assert!(early.insert_or_update(50, 0));
-            assert!(early.insert_or_update(50, 1));
-            let mut expired = Vec::new();
-            assert_eq!(early.pop_expired(49, &mut expired), 0);
-            assert!(expired.is_empty());
-        }
-
-        #[test]
-        fn update_moves_the_entry_in_both_directions() {
-            let mut heap = TimerHeap::new(4);
-            assert!(heap.insert_or_update(100, 0));
-            assert!(heap.insert_or_update(200, 1));
-            assert!(heap.insert_or_update(5, 0));
-            assert_eq!(heap.next_deadline(), Some(5));
-            assert_eq!(heap.len(), 2);
-            assert!(heap.insert_or_update(500, 0));
-            assert_eq!(heap.next_deadline(), Some(200));
-            assert!(heap.contains(0));
-            // Re-scheduling the same deadline keeps the entry where it is.
-            assert!(heap.insert_or_update(500, 0));
-            assert_eq!(heap.next_deadline(), Some(200));
-        }
-
-        #[test]
-        fn remove_reports_missing_entries_and_repairs_the_heap() {
-            let mut heap = TimerHeap::new(4);
-            assert!(!heap.remove(0));
-            assert!(heap.insert_or_update(10, 0));
-            assert!(heap.insert_or_update(20, 1));
-            assert!(heap.insert_or_update(30, 2));
-            assert!(heap.remove(0));
-            assert!(!heap.contains(0));
-            assert_eq!(heap.next_deadline(), Some(20));
-            assert_eq!(heap.len(), 2);
-            assert!(heap.remove(2));
-            assert_eq!(heap.next_deadline(), Some(20));
-        }
-
-        #[test]
-        fn capacity_is_fixed_and_indices_are_bounds_checked() {
-            let mut heap = TimerHeap::new(2);
-            assert!(heap.insert_or_update(1, 0));
-            assert!(heap.insert_or_update(2, 1));
-            // Full: a third distinct connection is refused instead of growing the heap.
-            assert!(!heap.insert_or_update(3, 2));
-            // Out-of-range indices are refused even when a slot is free.
-            assert!(!heap.insert_or_update(3, 99));
-            assert!(!heap.remove(99));
-            assert_eq!(heap.len(), 2);
-        }
-
-        #[test]
-        fn wait_is_infinite_when_empty_and_saturates_below_infinite() {
-            let mut heap = TimerHeap::new(2);
-            assert_eq!(heap.wait_milliseconds(10), INFINITE);
-            assert!(heap.insert_or_update(20, 0));
-            assert_eq!(heap.wait_milliseconds(10), 10);
-            assert_eq!(heap.wait_milliseconds(20), 0);
-            assert_eq!(heap.wait_milliseconds(25), 0);
-            assert!(heap.insert_or_update(u64::MAX, 0));
-            assert_eq!(heap.wait_milliseconds(0), INFINITE - 1);
-            assert_ne!(heap.wait_milliseconds(0), WAIT_TIMEOUT + 1);
-        }
-
-        #[test]
-        fn heap_matches_a_fixed_seed_reference_model() {
-            const CAPACITY: u32 = 64;
-            const STEPS: u32 = 20_000;
-            let mut heap = TimerHeap::new(CAPACITY as usize);
-            let mut active = vec![false; CAPACITY as usize];
-            let mut deadlines = vec![0u64; CAPACITY as usize];
-            let mut state = 0x51A7_E123u32;
-            for step in 0..STEPS {
-                let operation = xorshift(&mut state) & 3;
-                let index = xorshift(&mut state) % CAPACITY;
-                let now = u64::from(step % 4096);
-                match operation {
-                    0 | 1 => {
-                        let deadline = u64::from(xorshift(&mut state) % 4096);
-                        assert!(heap.insert_or_update(deadline, index));
-                        active[index as usize] = true;
-                        deadlines[index as usize] = deadline;
-                    }
-                    2 => {
-                        let expected = active[index as usize];
-                        assert_eq!(heap.remove(index), expected);
-                        active[index as usize] = false;
-                    }
-                    _ => {
-                        // pop_expired drains every deadline that has passed, ordered by
-                        // (deadline, index): the reference model builds that list directly.
-                        let mut expected: Vec<u32> = (0..CAPACITY)
-                            .filter(|candidate| {
-                                active[*candidate as usize] && deadlines[*candidate as usize] <= now
-                            })
-                            .collect();
-                        expected.sort_by_key(|candidate| (deadlines[*candidate as usize], *candidate));
-                        let mut expired = Vec::new();
-                        let count = heap.pop_expired(now, &mut expired);
-                        assert_eq!(count, expected.len());
-                        assert_eq!(expired, expected);
-                        for index in &expected {
-                            active[*index as usize] = false;
+                while !self.core.stopping || self.core.has_live() {
+                    if !self.core.stopping && self.failure.load(Ordering::Acquire) {
+                        self.stop_admission();
+                        if !self.core.has_live() {
+                            break;
                         }
                     }
-                }
-
-                // The heap root, the position map and the size must agree with the model.
-                let mut minimum: Option<u32> = None;
-                let mut active_count = 0;
-                for index in 0..CAPACITY {
-                    if !active[index as usize] {
-                        assert!(!heap.contains(index));
+                    let packet = get_queued_completion_status(self.port.raw(), 100);
+                    if packet.overlapped.is_null() && packet.key == STOP_KEY {
+                        self.stop_admission();
                         continue;
                     }
-                    active_count += 1;
-                    let position = heap.position_of(index).expect("scheduled connection has a position");
-                    assert!(position < heap.len());
-                    assert_eq!(heap.nodes[position].connection_index, index);
-                    assert_eq!(heap.nodes[position].deadline, deadlines[index as usize]);
-                    let better = match minimum {
-                        None => true,
-                        Some(current) => {
-                            (deadlines[index as usize], index) < (deadlines[current as usize], current)
+                    if packet.overlapped.is_null() && packet.key > STOP_KEY {
+                        let Some(operation) = self.table.find(packet.key) else {
+                            fail_fast("server accept acknowledgement identity", ERROR_INVALID_DATA);
+                        };
+                        let index = operation.index;
+                        // The worker adopts or closes the socket before acknowledging; anything
+                        // still attached here is a stray the acceptor reclaims.
+                        if let Some(stray) = self.table.clear_socket(index) {
+                            if stray != INVALID_SOCKET {
+                                let mut owner = SocketOwner::new(stray);
+                                owner.reset();
+                            }
                         }
-                    };
-                    if better {
-                        minimum = Some(index);
+                        match self.core.on_ack(index) {
+                            AcceptAction::Repost { index } => {
+                                if !self.post_accept(index) {
+                                    self.fail_admission("AcceptEx(repost)", ERROR_INVALID_DATA);
+                                }
+                            }
+                            AcceptAction::None => {}
+                            _ => {
+                                fail_fast("server accept acknowledgement state", ERROR_INVALID_DATA)
+                            }
+                        }
+                        continue;
+                    }
+                    if !packet.overlapped.is_null() {
+                        let Some(operation) = self.table.find(packet.overlapped as usize) else {
+                            fail_fast("server AcceptEx completion identity", ERROR_INVALID_DATA);
+                        };
+                        let index = operation.index;
+                        if self.table.overlapped_ptr(index) != packet.overlapped {
+                            fail_fast("server AcceptEx completion identity", ERROR_INVALID_DATA);
+                        }
+                        if !packet.succeeded {
+                            self.close_accept_socket(index);
+                            if !self.core.stopping && !self.failure.load(Ordering::Acquire) {
+                                self.statistics.network_errors =
+                                    self.statistics.network_errors.wrapping_add(1);
+                            }
+                        }
+                        match self
+                            .core
+                            .on_completion(index, packet.succeeded, packet.error)
+                        {
+                            AcceptAction::Repost { index } => {
+                                if !self.post_accept(index) {
+                                    self.fail_admission(
+                                        "AcceptEx(repost after reset)",
+                                        ERROR_INVALID_DATA,
+                                    );
+                                }
+                            }
+                            AcceptAction::Handoff { index, worker } => {
+                                match self.handoff(index, worker) {
+                                    HandoffOutcome::Posted => {}
+                                    HandoffOutcome::Withdrawn => {
+                                        // The acceptor closed this socket while unposting (a stop raced
+                                        // the completion); the slot goes back to idle and admission
+                                        // stays healthy unless it was not stopping.
+                                        self.core.abort_handoff(index);
+                                        if !self.core.stopping {
+                                            self.fail_admission(
+                                                "AcceptEx handoff withdrawn",
+                                                ERROR_INVALID_DATA,
+                                            );
+                                        }
+                                    }
+                                    HandoffOutcome::Failed => {
+                                        self.core.abort_handoff(index);
+                                        self.fail_admission("AcceptEx handoff", ERROR_INVALID_DATA);
+                                    }
+                                    HandoffOutcome::Rejected => {
+                                        self.core.abort_handoff(index);
+                                        if !self.post_accept(index) {
+                                            self.fail_admission(
+                                                "AcceptEx(repost after capacity rejection)",
+                                                ERROR_INVALID_DATA,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            AcceptAction::Fatal { error, .. } => {
+                                self.fail_admission("AcceptEx completion", error as i32);
+                            }
+                            AcceptAction::None => {}
+                        }
+                        continue;
+                    }
+                    if !packet.succeeded && packet.error != WAIT_TIMEOUT {
+                        self.statistics.network_errors =
+                            self.statistics.network_errors.wrapping_add(1);
+                        self.fail_admission(
+                            "GetQueuedCompletionStatus(acceptor)",
+                            packet.error as i32,
+                        );
                     }
                 }
-                assert_eq!(heap.len(), active_count);
-                if let Some(index) = minimum {
-                    assert_eq!(heap.nodes[0].connection_index, index);
-                    assert_eq!(heap.nodes[0].deadline, deadlines[index as usize]);
+            }
+
+            /// Applies the accept context, transfers the socket to the worker and posts the
+            /// handoff. Ownership leaves this thread with the transfer.
+            fn handoff(&mut self, index: u32, worker: u32) -> HandoffOutcome {
+                if self.core.stopping
+                    || self.failure.load(Ordering::Acquire)
+                    || self.listener.raw() == INVALID_SOCKET
+                {
+                    self.close_accept_socket(index);
+                    return HandoffOutcome::Withdrawn;
                 }
-                let expected_wait = match minimum {
-                    None => INFINITE,
-                    Some(index) if deadlines[index as usize] <= now => 0,
-                    Some(index) => (deadlines[index as usize] - now).min(u64::from(INFINITE) - 1) as u32,
+                let socket = self.operation_sockets[index as usize].release();
+                if socket == INVALID_SOCKET {
+                    // The socket is gone because the acceptor closed it while unposting; a stop
+                    // that raced a successful completion lands here.
+                    return HandoffOutcome::Withdrawn;
+                }
+                self.table.store_socket(index, socket);
+                if let Err(error) = update_accept_context(socket, self.listener.raw()) {
+                    self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
+                    report(error.stage, error.code);
+                    self.close_accept_socket(index);
+                    return HandoffOutcome::Failed;
+                }
+                if let Err(error) = configure_socket(socket, true, self.socket_buffer_bytes) {
+                    self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
+                    report(error.stage, error.code);
+                    self.close_accept_socket(index);
+                    return HandoffOutcome::Failed;
+                }
+                let Some(get_addresses) = self.get_accept_addresses else {
+                    fail_fast("GetAcceptExSockaddrs entry point", ERROR_INVALID_DATA);
                 };
-                assert_eq!(heap.wait_milliseconds(now), expected_wait);
+                let mut local = ptr::null_mut();
+                let mut remote = ptr::null_mut();
+                let mut local_length = 0;
+                let mut remote_length = 0;
+                unsafe {
+                    get_addresses(
+                        self.table.address_ptr(index),
+                        0,
+                        ACCEPT_ADDRESS_BYTES as u32,
+                        ACCEPT_ADDRESS_BYTES as u32,
+                        &mut local,
+                        &mut local_length,
+                        &mut remote,
+                        &mut remote_length,
+                    );
+                }
+                if local.is_null() || remote.is_null() || local_length <= 0 || remote_length <= 0 {
+                    report("GetAcceptExSockaddrs", 10_022);
+                    self.close_accept_socket(index);
+                    return HandoffOutcome::Failed;
+                }
+                let Some(worker) = self.core.reserve_worker(worker, &self.credits) else {
+                    self.statistics.rejected = self.statistics.rejected.wrapping_add(1);
+                    self.close_accept_socket(index);
+                    return HandoffOutcome::Rejected;
+                };
+                let Some(target) = self.workers.get(worker as usize).copied() else {
+                    fail_fast("server acceptor worker table", ERROR_INVALID_DATA);
+                };
+                let Some(key) = self
+                    .table
+                    .operation(index)
+                    .map(|operation| operation as *const crate::acceptor::AcceptOperation as usize)
+                else {
+                    fail_fast("server accept handoff identity", ERROR_INVALID_DATA);
+                };
+                if let Err(error) = post_completion(target.0, key, ptr::null_mut()) {
+                    fail_fast("PostQueuedCompletionStatus(accept handoff)", error.code);
+                }
+                HandoffOutcome::Posted
             }
         }
     }
-}
+
+    pub mod timer {
+        //! Worker-private index minimum heap over connection deadlines.
+        //!
+        //! Only the owning thread touches it, so no synchronisation is needed. The heap keeps a
+        //! position map so a connection's deadline can be updated or removed in place, and its
+        //! capacity is fixed for the whole run: it never grows past the worker's slot count.
+        //!
+        //! This is the same structure as ces_timer_heap in the C++ baseline and CESTimerHeap in
+        //! the Swift port, including the order rule (deadline, then index) and the wait rule
+        //! (INFINITE when empty, saturated one below INFINITE otherwise).
+
+        use crate::types::{INFINITE, TimerNode};
+
+        #[derive(Debug)]
+        pub struct TimerHeap {
+            capacity: usize,
+            size: usize,
+            nodes: Vec<TimerNode>,
+            /// Position of a connection inside `nodes`, or -1 when it has no deadline.
+            positions: Vec<i32>,
+        }
+
+        impl TimerHeap {
+            pub fn new(capacity: usize) -> Self {
+                Self {
+                    capacity,
+                    size: 0,
+                    nodes: vec![TimerNode::default(); capacity],
+                    positions: vec![-1; capacity],
+                }
+            }
+
+            pub fn capacity(&self) -> usize {
+                self.capacity
+            }
+
+            pub fn len(&self) -> usize {
+                self.size
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.size == 0
+            }
+
+            pub fn contains(&self, connection_index: u32) -> bool {
+                (connection_index as usize) < self.capacity
+                    && self.positions[connection_index as usize] >= 0
+            }
+
+            pub fn next_deadline(&self) -> Option<u64> {
+                if self.size == 0 {
+                    None
+                } else {
+                    Some(self.nodes[0].deadline)
+                }
+            }
+
+            /// Position of a connection inside the heap, as the reference model reads it.
+            pub fn position_of(&self, connection_index: u32) -> Option<usize> {
+                if (connection_index as usize) >= self.capacity {
+                    return None;
+                }
+                let position = self.positions[connection_index as usize];
+                if position < 0 {
+                    None
+                } else {
+                    Some(position as usize)
+                }
+            }
+
+            fn less(&self, a: usize, b: usize) -> bool {
+                let left = self.nodes[a];
+                let right = self.nodes[b];
+                (left.deadline, left.connection_index) < (right.deadline, right.connection_index)
+            }
+
+            fn swap(&mut self, a: usize, b: usize) {
+                self.nodes.swap(a, b);
+                let left = self.nodes[a].connection_index as usize;
+                let right = self.nodes[b].connection_index as usize;
+                self.positions[left] = a as i32;
+                self.positions[right] = b as i32;
+            }
+
+            fn sift_up(&mut self, mut index: usize) {
+                while index > 0 {
+                    let parent = (index - 1) / 2;
+                    if !self.less(index, parent) {
+                        break;
+                    }
+                    self.swap(index, parent);
+                    index = parent;
+                }
+            }
+
+            fn sift_down(&mut self, mut index: usize) {
+                loop {
+                    let left = index * 2 + 1;
+                    if left >= self.size {
+                        break;
+                    }
+                    let right = left + 1;
+                    let smallest = if right < self.size && self.less(right, left) {
+                        right
+                    } else {
+                        left
+                    };
+                    if !self.less(smallest, index) {
+                        break;
+                    }
+                    self.swap(index, smallest);
+                    index = smallest;
+                }
+            }
+
+            /// Schedules or reschedules a connection. Returns false when the index is outside the
+            /// fixed capacity or the heap is full: the caller must treat that as a hard failure
+            /// instead of silently dropping a deadline.
+            pub fn insert_or_update(&mut self, deadline: u64, connection_index: u32) -> bool {
+                let slot = connection_index as usize;
+                if slot >= self.capacity {
+                    return false;
+                }
+                let existing = self.positions[slot];
+                if existing >= 0 {
+                    let position = existing as usize;
+                    let previous = self.nodes[position].deadline;
+                    if deadline == previous {
+                        return true;
+                    }
+                    self.nodes[position].deadline = deadline;
+                    if deadline < previous {
+                        self.sift_up(position);
+                    } else {
+                        self.sift_down(position);
+                    }
+                    return true;
+                }
+                if self.size == self.capacity {
+                    return false;
+                }
+                let position = self.size;
+                self.size += 1;
+                self.nodes[position] = TimerNode {
+                    deadline,
+                    connection_index,
+                };
+                self.positions[slot] = position as i32;
+                self.sift_up(position);
+                true
+            }
+
+            /// Drops a connection's deadline. Removing an unscheduled connection is not an error.
+            pub fn remove(&mut self, connection_index: u32) -> bool {
+                let slot = connection_index as usize;
+                if slot >= self.capacity {
+                    return false;
+                }
+                let position = self.positions[slot];
+                if position < 0 {
+                    return false;
+                }
+                let position = position as usize;
+                self.positions[slot] = -1;
+                let last = self.size - 1;
+                self.size = last;
+                if position != last {
+                    self.nodes[position] = self.nodes[last];
+                    self.positions[self.nodes[position].connection_index as usize] =
+                        position as i32;
+                    let parent = if position > 0 {
+                        Some((position - 1) / 2)
+                    } else {
+                        None
+                    };
+                    if let Some(parent) = parent {
+                        if self.less(position, parent) {
+                            self.sift_up(position);
+                            return true;
+                        }
+                    }
+                    self.sift_down(position);
+                }
+                true
+            }
+
+            /// Wakes up only the connections whose deadline has passed. Each removed connection is
+            /// reported so the caller can close it.
+            pub fn pop_expired(&mut self, now: u64, out: &mut Vec<u32>) -> usize {
+                let mut count = 0;
+                while self.size > 0 && self.nodes[0].deadline <= now {
+                    let node = self.nodes[0];
+                    self.remove(node.connection_index);
+                    out.push(node.connection_index);
+                    count += 1;
+                }
+                count
+            }
+
+            /// Milliseconds to wait for the nearest deadline: INFINITE when nothing is scheduled,
+            /// zero when the nearest deadline has already passed, and otherwise one below INFINITE
+            /// at most so the value is always a usable timeout.
+            pub fn wait_milliseconds(&self, now: u64) -> u32 {
+                let Some(deadline) = self.next_deadline() else {
+                    return INFINITE;
+                };
+                if deadline <= now {
+                    return 0;
+                }
+                let remaining = deadline - now;
+                remaining.min(u64::from(INFINITE) - 1) as u32
+            }
+        }
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::types::WAIT_TIMEOUT;
+
+            fn xorshift(state: &mut u32) -> u32 {
+                let mut value = *state;
+                value ^= value << 13;
+                value ^= value >> 17;
+                value ^= value << 5;
+                *state = value;
+                value
+            }
+
+            #[test]
+            fn orders_by_deadline_then_index() {
+                let mut heap = TimerHeap::new(8);
+                assert!(heap.insert_or_update(30, 2));
+                assert!(heap.insert_or_update(10, 1));
+                assert!(heap.insert_or_update(20, 0));
+                assert_eq!(heap.next_deadline(), Some(10));
+                let mut expired = Vec::new();
+                assert_eq!(heap.pop_expired(25, &mut expired), 2);
+                assert_eq!(expired, vec![1, 0]);
+                assert_eq!(heap.next_deadline(), Some(30));
+                assert_eq!(heap.len(), 1);
+                // Equal deadlines are ordered by connection index.
+                let mut tied = TimerHeap::new(4);
+                assert!(tied.insert_or_update(50, 3));
+                assert!(tied.insert_or_update(50, 1));
+                let mut expired = Vec::new();
+                // Both deadlines passed at once; the pop order is by index.
+                assert_eq!(tied.pop_expired(50, &mut expired), 2);
+                assert_eq!(expired, vec![1, 3]);
+                // Nothing else was due before the deadline.
+                let mut early = TimerHeap::new(2);
+                assert!(early.insert_or_update(50, 0));
+                assert!(early.insert_or_update(50, 1));
+                let mut expired = Vec::new();
+                assert_eq!(early.pop_expired(49, &mut expired), 0);
+                assert!(expired.is_empty());
+            }
+
+            #[test]
+            fn update_moves_the_entry_in_both_directions() {
+                let mut heap = TimerHeap::new(4);
+                assert!(heap.insert_or_update(100, 0));
+                assert!(heap.insert_or_update(200, 1));
+                assert!(heap.insert_or_update(5, 0));
+                assert_eq!(heap.next_deadline(), Some(5));
+                assert_eq!(heap.len(), 2);
+                assert!(heap.insert_or_update(500, 0));
+                assert_eq!(heap.next_deadline(), Some(200));
+                assert!(heap.contains(0));
+                // Re-scheduling the same deadline keeps the entry where it is.
+                assert!(heap.insert_or_update(500, 0));
+                assert_eq!(heap.next_deadline(), Some(200));
+            }
+
+            #[test]
+            fn remove_reports_missing_entries_and_repairs_the_heap() {
+                let mut heap = TimerHeap::new(4);
+                assert!(!heap.remove(0));
+                assert!(heap.insert_or_update(10, 0));
+                assert!(heap.insert_or_update(20, 1));
+                assert!(heap.insert_or_update(30, 2));
+                assert!(heap.remove(0));
+                assert!(!heap.contains(0));
+                assert_eq!(heap.next_deadline(), Some(20));
+                assert_eq!(heap.len(), 2);
+                assert!(heap.remove(2));
+                assert_eq!(heap.next_deadline(), Some(20));
+            }
+
+            #[test]
+            fn capacity_is_fixed_and_indices_are_bounds_checked() {
+                let mut heap = TimerHeap::new(2);
+                assert!(heap.insert_or_update(1, 0));
+                assert!(heap.insert_or_update(2, 1));
+                // Full: a third distinct connection is refused instead of growing the heap.
+                assert!(!heap.insert_or_update(3, 2));
+                // Out-of-range indices are refused even when a slot is free.
+                assert!(!heap.insert_or_update(3, 99));
+                assert!(!heap.remove(99));
+                assert_eq!(heap.len(), 2);
+            }
+
+            #[test]
+            fn wait_is_infinite_when_empty_and_saturates_below_infinite() {
+                let mut heap = TimerHeap::new(2);
+                assert_eq!(heap.wait_milliseconds(10), INFINITE);
+                assert!(heap.insert_or_update(20, 0));
+                assert_eq!(heap.wait_milliseconds(10), 10);
+                assert_eq!(heap.wait_milliseconds(20), 0);
+                assert_eq!(heap.wait_milliseconds(25), 0);
+                assert!(heap.insert_or_update(u64::MAX, 0));
+                assert_eq!(heap.wait_milliseconds(0), INFINITE - 1);
+                assert_ne!(heap.wait_milliseconds(0), WAIT_TIMEOUT + 1);
+            }
+
+            #[test]
+            fn heap_matches_a_fixed_seed_reference_model() {
+                const CAPACITY: u32 = 64;
+                const STEPS: u32 = 20_000;
+                let mut heap = TimerHeap::new(CAPACITY as usize);
+                let mut active = vec![false; CAPACITY as usize];
+                let mut deadlines = vec![0u64; CAPACITY as usize];
+                let mut state = 0x51A7_E123u32;
+                for step in 0..STEPS {
+                    let operation = xorshift(&mut state) & 3;
+                    let index = xorshift(&mut state) % CAPACITY;
+                    let now = u64::from(step % 4096);
+                    match operation {
+                        0 | 1 => {
+                            let deadline = u64::from(xorshift(&mut state) % 4096);
+                            assert!(heap.insert_or_update(deadline, index));
+                            active[index as usize] = true;
+                            deadlines[index as usize] = deadline;
+                        }
+                        2 => {
+                            let expected = active[index as usize];
+                            assert_eq!(heap.remove(index), expected);
+                            active[index as usize] = false;
+                        }
+                        _ => {
+                            // pop_expired drains every deadline that has passed, ordered by
+                            // (deadline, index): the reference model builds that list directly.
+                            let mut expected: Vec<u32> = (0..CAPACITY)
+                                .filter(|candidate| {
+                                    active[*candidate as usize]
+                                        && deadlines[*candidate as usize] <= now
+                                })
+                                .collect();
+                            expected.sort_by_key(|candidate| {
+                                (deadlines[*candidate as usize], *candidate)
+                            });
+                            let mut expired = Vec::new();
+                            let count = heap.pop_expired(now, &mut expired);
+                            assert_eq!(count, expected.len());
+                            assert_eq!(expired, expected);
+                            for index in &expected {
+                                active[*index as usize] = false;
+                            }
+                        }
+                    }
+
+                    // The heap root, the position map and the size must agree with the model.
+                    let mut minimum: Option<u32> = None;
+                    let mut active_count = 0;
+                    for index in 0..CAPACITY {
+                        if !active[index as usize] {
+                            assert!(!heap.contains(index));
+                            continue;
+                        }
+                        active_count += 1;
+                        let position = heap
+                            .position_of(index)
+                            .expect("scheduled connection has a position");
+                        assert!(position < heap.len());
+                        assert_eq!(heap.nodes[position].connection_index, index);
+                        assert_eq!(heap.nodes[position].deadline, deadlines[index as usize]);
+                        let better = match minimum {
+                            None => true,
+                            Some(current) => {
+                                (deadlines[index as usize], index)
+                                    < (deadlines[current as usize], current)
+                            }
+                        };
+                        if better {
+                            minimum = Some(index);
+                        }
+                    }
+                    assert_eq!(heap.len(), active_count);
+                    if let Some(index) = minimum {
+                        assert_eq!(heap.nodes[0].connection_index, index);
+                        assert_eq!(heap.nodes[0].deadline, deadlines[index as usize]);
+                    }
+                    let expected_wait = match minimum {
+                        None => INFINITE,
+                        Some(index) if deadlines[index as usize] <= now => 0,
+                        Some(index) => {
+                            (deadlines[index as usize] - now).min(u64::from(INFINITE) - 1) as u32
+                        }
+                    };
+                    assert_eq!(heap.wait_milliseconds(now), expected_wait);
+                }
+            }
+        }
+    }
 }
