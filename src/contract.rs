@@ -248,7 +248,7 @@ pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
     if options.protocol == Protocol::Tcp && saw_udp_depth {
         return Err(ArgumentError(crate::contract::token::PROTOCOL_OPTION.to_string()));
     }
-    if options.protocol == Protocol::Udp && (saw_timeout || saw_workers) {
+    if options.protocol == Protocol::Udp && (saw_timeout) {
         return Err(ArgumentError(crate::contract::token::PROTOCOL_OPTION.to_string()));
     }
     // Option validation precedes the help short-circuit, exactly like the reference: /h never
