@@ -666,6 +666,63 @@ pub mod arena {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        use windows::Win32::mswsock::RIO_EXTENSION_FUNCTION_TABLE;
+        use windows::Win32::mswsockdef::{RIO_BUFFERID, RIO_INVALID_BUFFERID};
+
+        static SLOT_REGISTER_CALLS: AtomicU32 = AtomicU32::new(0);
+        static SLOT_FAIL_AT: AtomicU32 = AtomicU32::new(0);
+        static SLOT_DEREGISTERED: AtomicU64 = AtomicU64::new(0);
+
+        unsafe extern "system" fn register_slot(_: *mut i8, length: u32) -> RIO_BUFFERID {
+            let call = SLOT_REGISTER_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+            if length != 1024 || call == SLOT_FAIL_AT.load(Ordering::Relaxed) {
+                unsafe { windows::Win32::winsock2::WSASetLastError(10_055) };
+                RIO_INVALID_BUFFERID
+            } else {
+                call as usize as RIO_BUFFERID
+            }
+        }
+
+        unsafe extern "system" fn deregister_slot(id: RIO_BUFFERID) {
+            SLOT_DEREGISTERED.fetch_add(1u64 << (id as usize), Ordering::Relaxed);
+        }
+
+        #[test]
+        fn concurrent_slots_have_independent_ids_and_failed_registration_rolls_back() {
+            SLOT_REGISTER_CALLS.store(0, Ordering::Relaxed);
+            SLOT_FAIL_AT.store(0, Ordering::Relaxed);
+            SLOT_DEREGISTERED.store(0, Ordering::Relaxed);
+            let rio = RioFunctions {
+                table: RIO_EXTENSION_FUNCTION_TABLE {
+                    RIORegisterBuffer: Some(register_slot),
+                    RIODeregisterBuffer: Some(deregister_slot),
+                    ..RIO_EXTENSION_FUNCTION_TABLE::default()
+                },
+            };
+            let arena = Arena::create(&rio, 3 * 1024, 1024).unwrap();
+            for index in 0..3 {
+                let full = arena.slot_view(index, 1024).unwrap();
+                let tail = arena.slot_tail_view(index, 1024, 512, 512).unwrap();
+                assert_eq!(full.BufferId as usize, index as usize + 1);
+                assert_eq!(tail.BufferId, full.BufferId);
+                assert_eq!(full.Offset, 0);
+                assert_eq!(tail.Offset, 512);
+            }
+            drop(arena);
+            assert_eq!(SLOT_DEREGISTERED.load(Ordering::Relaxed), 0b1110);
+
+            SLOT_REGISTER_CALLS.store(0, Ordering::Relaxed);
+            SLOT_FAIL_AT.store(3, Ordering::Relaxed);
+            SLOT_DEREGISTERED.store(0, Ordering::Relaxed);
+            let error = match Arena::create(&rio, 3 * 1024, 1024) {
+                Ok(_) => panic!("third registration must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, 10_055);
+            assert_eq!(SLOT_REGISTER_CALLS.load(Ordering::Relaxed), 3);
+            assert_eq!(SLOT_DEREGISTERED.load(Ordering::Relaxed), 0b0110);
+        }
 
         #[test]
         fn slot_arithmetic_is_checked() {

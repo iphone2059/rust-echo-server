@@ -50,6 +50,26 @@ pub fn checked_arena_bytes(slots: u64, stride: u64, memory_limit: u64) -> Option
     checked_product(slots, stride).filter(|bytes| *bytes <= memory_limit)
 }
 
+/// Keep the logical slot length while charging the actual page-rounded allocation.
+pub fn checked_page_rounded_arena_bytes(
+    slots: u64,
+    stride: u64,
+    memory_limit: u64,
+    page: u64,
+) -> Option<u64> {
+    if page == 0 {
+        return None;
+    }
+    let bytes = checked_product(slots, stride)?;
+    let remainder = bytes % page;
+    let allocated = if remainder == 0 {
+        bytes
+    } else {
+        bytes.checked_add(page - remainder)?
+    };
+    (allocated <= memory_limit).then_some(bytes)
+}
+
 /// ws2def.h: the reference sizes a datagram slot as the payload plus SOCKADDR_STORAGE and its
 /// sixteen trailing bytes, which is the stride its arena uses.
 pub const UDP_ADDRESS_BYTES: u64 = 144;
@@ -353,7 +373,12 @@ fn parse_arguments(arguments: &[Argument]) -> Result<Options, ArgumentError> {
             return Err(ArgumentError(token::CQ_CAPACITY.to_string()));
         }
         let stride = u64::from(options.rio_buffer_bytes) + UDP_ADDRESS_BYTES;
-        match checked_arena_bytes(u64::from(options.udp_depth), stride, options.memory_bytes) {
+        match checked_page_rounded_arena_bytes(
+            u64::from(options.udp_depth),
+            stride,
+            options.memory_bytes,
+            crate::native::page_bytes(),
+        ) {
             Some(bytes) if bytes <= u64::from(u32::MAX) => {}
             _ => return Err(ArgumentError(token::MEMORY_CAPACITY.to_string())),
         }
@@ -433,6 +458,66 @@ mod tests {
         let mut offset = 0;
         assert!(advance_offset(10, 4, &mut offset));
         assert!(!advance_offset(10, 7, &mut offset));
+    }
+
+    #[test]
+    fn udp_budget_charges_page_rounding_without_adding_slots() {
+        assert_eq!(
+            checked_page_rounded_arena_bytes(16, 65_651, 1_050_416, 4096),
+            None
+        );
+        assert_eq!(
+            checked_page_rounded_arena_bytes(16, 65_651, 1_052_671, 4096),
+            None
+        );
+        assert_eq!(
+            checked_page_rounded_arena_bytes(16, 65_651, 1_052_672, 4096),
+            Some(1_050_416)
+        );
+        assert_eq!(
+            checked_page_rounded_arena_bytes(1, u64::MAX, u64::MAX, 4096),
+            None
+        );
+        assert_eq!(
+            checked_page_rounded_arena_bytes(u64::MAX, 2, u64::MAX, 4096),
+            None
+        );
+        assert_eq!(
+            checked_page_rounded_arena_bytes(1, 4096, 4096, 4096),
+            Some(4096)
+        );
+        assert_eq!(checked_page_rounded_arena_bytes(1, 1, 4096, 0), None);
+        assert_eq!(
+            checked_page_rounded_arena_bytes(4097, 1_048_320, 4_294_967_296, 4096),
+            Some(4_294_967_040)
+        );
+    }
+
+    #[test]
+    fn udp_help_does_not_mask_page_rounded_memory_capacity() {
+        assert_eq!(
+            parse(&args(&[
+                "/h", "/p", "udp", "/k", "16", "/memory", "1050416"
+            ]))
+            .unwrap_err()
+            .0,
+            token::MEMORY_CAPACITY
+        );
+        let page = crate::native::page_bytes();
+        let raw = 16 * 65_651u64;
+        let budget = raw.div_ceil(page) * page;
+        let budget_text = budget.to_string();
+        let options = parse(&args(&[
+            "/h",
+            "/p",
+            "udp",
+            "/k",
+            "16",
+            "/memory",
+            &budget_text,
+        ]))
+        .unwrap();
+        assert_eq!(options.udp_depth, 16);
     }
 
     #[test]

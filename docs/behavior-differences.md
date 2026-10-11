@@ -18,7 +18,7 @@
 
 ## Rust 保留的实现方式
 
-- 工作线程、CQ 和单次 `VirtualAlloc` arena 分配模式与 C++ 相同，但 Rust 为每个 TCP 连接槽或 UDP 槽独立注册 `BufferId`，RIO 描述符使用槽内偏移。微软 [RIOSend 文档](https://learn.microsoft.com/en-us/windows/win32/api/mswsock/nc-mswsock-lpfn_riosend)要求发送期间整段注册不能用于并行收发；当前 C++ 多槽共用一个注册的方式存在违反该约束的潜在缺陷，Rust 不复制这一行为。arena 字节数、页预算和 CQ 容量保持原有计算，注册失败先解除已成功的槽注册，再释放页面。
+- 工作线程、CQ 和单次 `VirtualAlloc` arena 分配模式与 C++ 相同。两端为每个 TCP 连接槽或 UDP 槽独立注册 `BufferId`，RIO 描述符使用槽内偏移，遵循微软 [RIOSend 文档](https://learn.microsoft.com/en-us/windows/win32/api/mswsock/nc-mswsock-lpfn_riosend)的并发注册区约束。UDP 在比较 `/memory` 前检查页取整后的分配大小，同时保留原始槽位长度；注册失败先解除已成功的槽注册，再释放页面。
 - `server.rs` 是 Winsock/RIO 装载与协议分发入口，`engine.rs` 是无原生句柄的 TCP 状态机，两者职责不同。实际线程、TCP 接入与 UDP 循环位于 `internal.rs`，由库的历史模块路径重导出。
 - 采用 `std::thread`、`Arc` 与原子信用；接受 socket 通过原子交换转移所有权。跨线程固定接受表的 Win32 输出区使用 `UnsafeCell`，immutable 索引和身份字段保持独立；RIO 请求地址在解引用前校验范围、对齐与索引。
 - 原生错误在调用点分别通过 `GetLastError` 或 `WSAGetLastError` 捕获。`RIO_INVALID_BUFFERID` 使用 Windows x64 的 `0x00000000FFFFFFFF` sentinel，不能当作合法注册。

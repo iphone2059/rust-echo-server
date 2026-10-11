@@ -1,0 +1,232 @@
+{
+  "contract": "echo-binary-contract-v1",
+  "validation_date": "2026-10-11",
+  "repository": "rust-echo-server",
+  "base_head": "9fd187bd3facda8500032e36343addbf9956f9c8",
+  "verified_working_tree_changes": true,
+  "provenance": "Source file hashes identify the validated code before the final commit; final four repository SHAs are in the external archive manifest.",
+  "environment": {
+    "captured_at": "2026-10-11T15:49:39.1796786+08:00",
+    "operating_system": "Microsoft Windows Server 2022 Datacenter",
+    "os_version": "10.0.20348",
+    "build": "20348",
+    "architecture": "64-bit",
+    "rustc": [
+      "rustc 1.101.0-nightly (32dba69d6 2026-10-09)",
+      "binary: rustc",
+      "commit-hash: 32dba69d69c5b10ea89a4042de8d0619f7756203",
+      "commit-date: 2026-10-09",
+      "host: x86_64-pc-windows-msvc",
+      "release: 1.101.0-nightly",
+      "LLVM version: 23.1.3"
+    ],
+    "cargo": "cargo 1.101.0-nightly (29c5daa1a 2026-10-07)",
+    "visual_studio": "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise",
+    "msvc_compiler": "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise\\VC\\Tools\\MSVC\\14.51.36231\\bin\\Hostx64\\x64\\cl.exe",
+    "msvc_version": "19.51.36260.0",
+    "provider_dll": "C:\\Windows\\System32\\mswsock.dll",
+    "provider_version": "10.0.20348.1 (WinBuild.160101.0800)",
+    "provider_sha256": "54ACE887D3ADC9F0A6492FCC1EB80BE892999A1A4EF11030D436BBAC38D2E5BA"
+  },
+  "source_files": [
+    {
+      "path": "Cargo.toml",
+      "sha256": "29E296453F2ABA16AA5A29C2A78978DD74CF06894E8C6ADA720F9A089DAFE4E3"
+    },
+    {
+      "path": "src/contract.rs",
+      "sha256": "ADC46CCA6EEEC65ECF149BA67CEDBBF4C7D286D4B601156A4DD6CA1BA045F7E2"
+    },
+    {
+      "path": "src/engine.rs",
+      "sha256": "5EFF603D5E5E2E2AA4AC5ADA0E3BE1926D4AF8F90548780C1931B846BB155959"
+    },
+    {
+      "path": "src/internal.rs",
+      "sha256": "843162608731C04BDA46F52CD9BCC5848FE81A1D47A784B66C79954A0C397277"
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "FE9C227E2FA55EF806B769ACFDB20BAB48F7E5FF7919A1A927E3AFF58682C76F"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "9E16ED7402FD624C34A8201C1F12C9DCCEB65D0E554B208BC9E1092D8CADF450"
+    },
+    {
+      "path": "src/native.rs",
+      "sha256": "CAEC765EE30D9807F83A445A27D02CF40A6952BE5EBC648D97AE76769ABE7E06"
+    },
+    {
+      "path": "src/server.rs",
+      "sha256": "7711A6EBD4673D7B8EF1C5E3B4F88DD22018D15888F938191550D2CD9A155CB7"
+    },
+    {
+      "path": "src/types.rs",
+      "sha256": "030B627C40473A3E861620949FB1D24C9F33991AF30B08B10AC5DB029786E1A5"
+    },
+    {
+      "path": "tests/ces_interop_tests.ps1",
+      "sha256": "A77570BBED7452FB8B38BDA8BCEA3F67DE2D2327127CFC633AE1CFA88B6ED4ED"
+    },
+    {
+      "path": "tests/ces_process_tests.ps1",
+      "sha256": "84E187BD9FDDD049FD1E5950A44C679BF06A5E0E0B4109FE0FB5CC8F1769FF6B"
+    },
+    {
+      "path": "tests/ces_reset_storm_tests.ps1",
+      "sha256": "5F4A639394F2402D3929344ED278130F6AC6B489D8FD0D21D958AB85BC6C7242"
+    },
+    {
+      "path": "tests/ces_source_policy_tests.ps1",
+      "sha256": "A846062C637EF85D16C2FAD8D3A5A22CFF977A318B6754CCCD2D1E32F26A77A1"
+    },
+    {
+      "path": "tests/ces_source_policy.ps1",
+      "sha256": "BEBB725679D97B7E991D204EB22397E371CC152346C0F062141CA43789D39E1C"
+    },
+    {
+      "path": "tools/verification/contract-version.txt",
+      "sha256": "C8DE57B588CAEBD8BB43D5B82F19042719ADD2DE5DA09CFB06B9E5956C821FAD"
+    },
+    {
+      "path": "tools/verification/executable.txt",
+      "sha256": "423BD4A5AED511BC68DA77DB7754884AF0D40AA9197E5E47B2A7E62CF159358F"
+    },
+    {
+      "path": "tools/verification/features.txt",
+      "sha256": "5D5A3EB46FAD22D771145CE2291FC500B54C426713D4171F21169E8C9DD2D985"
+    },
+    {
+      "path": "tools/verification/peer-client.txt",
+      "sha256": "5CCA8627EDF81725B222362427C03516FD20172EFB21DCE5F2FFD8B9226D2C59"
+    },
+    {
+      "path": "tools/verification/results/.gitignore",
+      "sha256": "12BC126C5F9C824602C3DCC816FD57F935CD86D3D9CCC9E6C9C89253FFE2094D"
+    },
+    {
+      "path": "tools/verification/test.ps1",
+      "sha256": "39107313082EF84E5B4DCAC33B31F45E368B1D7EFECC3F7E419981B804136073"
+    }
+  ],
+  "binaries": [
+    {
+      "profile": "Release",
+      "path": "target/release/rust-echo-server.exe",
+      "sha256": "D498DB351C18C18071231AE63DA3597055276FCF2931972116BAA0FA950AC808"
+    },
+    {
+      "profile": "Debug",
+      "path": "target/debug/rust-echo-server.exe",
+      "sha256": "2ADA8DEC1E4FFCA7B5C741BC29F3075ECAC2C016074FA1411A0A5E2444EDB801"
+    }
+  ],
+  "dependencies": [
+    {
+      "profile": "Release",
+      "windows_rs_sha": "d5b6a1f68f4fdd0c79495954d162901ea90da4f4",
+      "source": "https://github.com/microsoft/windows-rs",
+      "tracks": "default branch, no fixed rev"
+    },
+    {
+      "profile": "Debug",
+      "windows_rs_sha": "d5b6a1f68f4fdd0c79495954d162901ea90da4f4",
+      "source": "https://github.com/microsoft/windows-rs",
+      "tracks": "default branch, no fixed rev"
+    }
+  ],
+  "gates": [
+    "format.ps1 PASS",
+    "build_release.ps1 PASS",
+    "build_debug.ps1 PASS"
+  ],
+  "reset_storm": "Both C++ and Rust servers passed 400 pre-accept RST connections in Release and Debug",
+  "common_suite": {
+    "profile": "Release",
+    "cases": 28,
+    "failed": 0,
+    "csv": "repair-validation-2026-10-11.csv",
+    "sha256": "10729FA5CDAF4C5F25BEA8545230BE5AA48290A8C77505F896B97B0221761D87"
+  },
+  "matrix": [
+    {
+      "client": "cpp",
+      "server": "cpp",
+      "profile": "Release",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "suite-cpp-echo-client-Release",
+      "csv_sha256": "5F4150A1748C394C4FB486D01E05ED6C894C329741E47F23E8DD790A57612B0F"
+    },
+    {
+      "client": "cpp",
+      "server": "rust",
+      "profile": "Release",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-cpp-to-rust-Release",
+      "csv_sha256": "E26B473539AF30B4D5F05DF581A8915340593D141BFD4AC3F54DDDD892B084BC"
+    },
+    {
+      "client": "rust",
+      "server": "cpp",
+      "profile": "Release",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-rust-to-cpp-Release",
+      "csv_sha256": "424CBB229975CB215C21A8079C4AA83C29D62412482E18520C614871958607D0"
+    },
+    {
+      "client": "rust",
+      "server": "rust",
+      "profile": "Release",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "suite-rust-echo-client-Release",
+      "csv_sha256": "44E51CB268AA293D107FCF0FFD05E8397865A5707424EC3D65A71944A966F714"
+    },
+    {
+      "client": "cpp",
+      "server": "cpp",
+      "profile": "Debug",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-cpp-to-cpp-Debug",
+      "csv_sha256": "A638E74D72A6A68E56DB1890C5DDA36DDEA05B8940455C7FC83A5D73C0AD9CBD"
+    },
+    {
+      "client": "cpp",
+      "server": "rust",
+      "profile": "Debug",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-cpp-to-rust-Debug",
+      "csv_sha256": "AACCE809FA463D33FA89B4AA85946F074826AEE787EBEA20DFFE7F683AB2552D"
+    },
+    {
+      "client": "rust",
+      "server": "cpp",
+      "profile": "Debug",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-rust-to-cpp-Debug",
+      "csv_sha256": "25B91DFE51985B4C02AC77004D531D3C77F078F3D05AFCD72D0742034022412F"
+    },
+    {
+      "client": "rust",
+      "server": "rust",
+      "profile": "Debug",
+      "cases": 11,
+      "failed": 0,
+      "artifact": "matrix-rust-to-rust-Debug",
+      "csv_sha256": "A7E2550C9FD000150496134573D4F3D222BBFB008CD6A6AE8772CF31A46198A0"
+    }
+  ],
+  "native_fault_limits": "AcceptEx statuses and Rust partial-send/error are injected at native function-table entry points. C++ partial-send regression covers real window arithmetic; normal provider partial-send behavior was not forced.",
+  "retained_differences": [
+    "Compatible historical crate and module names",
+    "Existing abnormal-provider shutdown safety policies",
+    "Vec step queue; no unmeasured performance claim"
+  ]
+}

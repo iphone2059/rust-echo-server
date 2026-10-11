@@ -1267,7 +1267,7 @@ pub mod udp {
         use windows::Win32::minwinbase::OVERLAPPED;
         use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
 
-        use crate::contract::checked_arena_bytes;
+        use crate::contract::checked_page_rounded_arena_bytes;
         use crate::native::arena::{Arena, udp_stride};
         use crate::native::rio::{
             CompletionPort, CompletionQueue, RequestQueue, empty_result,
@@ -1532,10 +1532,11 @@ pub mod udp {
                 return ExitCode::Usage;
             };
             let depth = options.udp_depth;
-            let arena_bytes = match checked_arena_bytes(
+            let arena_bytes = match checked_page_rounded_arena_bytes(
                 u64::from(depth),
                 u64::from(stride),
                 options.memory_bytes,
+                crate::native::page_bytes(),
             ) {
                 Some(bytes)
                     if bytes > 0
@@ -3107,6 +3108,306 @@ pub mod worker {
                     fail_fast("PostQueuedCompletionStatus(accept handoff)", error.code);
                 }
                 HandoffOutcome::Posted
+            }
+        }
+
+        #[cfg(test)]
+        mod native_accept_tests {
+            use super::*;
+            use core::ffi::c_void;
+            use std::cell::RefCell;
+            use windows::Win32::minwinbase::OVERLAPPED;
+            use windows::Win32::winsock2::{SOCKET, WSAGetLastError, WSASetLastError, getsockopt};
+            use windows::Win32::ws2::{SO_TYPE, SOL_SOCKET};
+
+            static ACCEPT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+            #[derive(Default)]
+            struct AcceptProbe {
+                error: i32,
+                sockets: Vec<SOCKET>,
+                overlapped: Vec<usize>,
+                valid_arguments: bool,
+                complete_on_post: bool,
+                port: usize,
+                completion_posted: bool,
+                pending_after: Option<usize>,
+            }
+
+            thread_local! {
+                static ACCEPT_PROBE: RefCell<AcceptProbe> = RefCell::new(AcceptProbe::default());
+            }
+
+            fn socket_is_open(socket: SOCKET) -> bool {
+                let mut kind: i32 = 0;
+                let mut length = core::mem::size_of::<i32>() as i32;
+                unsafe {
+                    getsockopt(
+                        socket,
+                        SOL_SOCKET,
+                        SO_TYPE,
+                        (&mut kind as *mut i32).cast(),
+                        &mut length,
+                    ) == 0
+                }
+            }
+
+            // Only AcceptEx is replaced. Socket creation/close, OVERLAPPED/table ownership,
+            // PostQueuedCompletionStatus and GetQueuedCompletionStatus use the real native path.
+            unsafe extern "system" fn injected_accept(
+                listener: SOCKET,
+                accepted: SOCKET,
+                output: *mut c_void,
+                receive_length: u32,
+                local_length: u32,
+                remote_length: u32,
+                received: *mut u32,
+                overlapped: *mut OVERLAPPED,
+            ) -> windows::core::BOOL {
+                let error = ACCEPT_PROBE.with(|probe| {
+                    let mut probe = probe.borrow_mut();
+                    probe.sockets.push(accepted);
+                    probe.overlapped.push(overlapped as usize);
+                    probe.valid_arguments &= socket_is_open(listener)
+                        && socket_is_open(accepted)
+                        && !output.is_null()
+                        && !received.is_null()
+                        && !overlapped.is_null()
+                        && receive_length == 0
+                        && local_length == ACCEPT_ADDRESS_BYTES as u32
+                        && remote_length == ACCEPT_ADDRESS_BYTES as u32;
+                    let resume_pending = probe
+                        .pending_after
+                        .is_some_and(|count| probe.sockets.len() > count);
+                    if resume_pending {
+                        probe.completion_posted =
+                            post_completion(probe.port as _, STOP_KEY, ptr::null_mut()).is_ok();
+                        probe.completion_posted &=
+                            post_completion(probe.port as _, 0, overlapped).is_ok();
+                    } else if probe.complete_on_post {
+                        probe.completion_posted =
+                            post_completion(probe.port as _, 0, overlapped).is_ok();
+                    }
+                    if resume_pending {
+                        ERROR_IO_PENDING
+                    } else {
+                        probe.error
+                    }
+                });
+                unsafe { WSASetLastError(error) };
+                windows::core::BOOL(0)
+            }
+
+            fn acceptor(error: i32, complete_on_post: bool) -> AcceptorRuntime {
+                let listener = registered_socket(Protocol::Tcp).expect("registered listener");
+                bind_endpoint(listener.raw(), 0).expect("ephemeral listener bind");
+                listen_endpoint(listener.raw()).expect("listen");
+                let port = CompletionPort::create().expect("acceptor IOCP");
+                port.associate_socket(listener.raw())
+                    .expect("associate listener");
+                let table = Arc::new(AcceptTable::new(1, SendHandle(port.raw())));
+                ACCEPT_PROBE.with(|probe| {
+                    *probe.borrow_mut() = AcceptProbe {
+                        error,
+                        valid_arguments: true,
+                        complete_on_post,
+                        port: port.raw() as usize,
+                        ..AcceptProbe::default()
+                    }
+                });
+                AcceptorRuntime {
+                    core: AcceptorCore::new(1, 1),
+                    listener,
+                    port,
+                    accept_ex: Some(injected_accept),
+                    get_accept_addresses: None,
+                    table,
+                    operation_sockets: vec![SocketOwner::new(INVALID_SOCKET)].into_boxed_slice(),
+                    workers: Vec::new(),
+                    credits: Vec::new(),
+                    socket_buffer_bytes: 0,
+                    failure: Arc::new(AtomicBool::new(false)),
+                    statistics: Statistics::default(),
+                }
+            }
+
+            fn assert_probe_closed(expected_calls: usize, identity: usize) {
+                ACCEPT_PROBE.with(|probe| {
+                    let probe = probe.borrow();
+                    assert_eq!(probe.sockets.len(), expected_calls);
+                    assert!(probe.valid_arguments);
+                    assert_eq!(probe.overlapped, vec![identity; expected_calls]);
+                    for &socket in &probe.sockets {
+                        assert!(
+                            !socket_is_open(socket),
+                            "failed/stopped accept socket leaked"
+                        );
+                        assert_eq!(unsafe { WSAGetLastError() }, 10_038);
+                    }
+                });
+            }
+
+            fn assert_empty_port(runtime: &AcceptorRuntime) {
+                let packet = get_queued_completion_status(runtime.port.raw(), 0);
+                assert!(!packet.succeeded);
+                assert_eq!(packet.error, WAIT_TIMEOUT);
+                assert!(packet.overlapped.is_null());
+            }
+
+            struct NativeRunDeadline {
+                finished: std::sync::mpsc::Sender<()>,
+                watcher: Option<JoinHandle<()>>,
+            }
+
+            impl NativeRunDeadline {
+                fn start() -> Self {
+                    let (finished, completion) = std::sync::mpsc::channel();
+                    let watcher = thread::spawn(move || {
+                        if matches!(
+                            completion.recv_timeout(Duration::from_secs(10)),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        ) {
+                            eprintln!(
+                                "native AcceptEx regression exceeded its 10-second drain deadline"
+                            );
+                            // Do not unwind/drop OVERLAPPED storage that a hung acceptor still owns.
+                            std::process::abort();
+                        }
+                    });
+                    Self {
+                        finished,
+                        watcher: Some(watcher),
+                    }
+                }
+            }
+
+            impl Drop for NativeRunDeadline {
+                fn drop(&mut self) {
+                    let _ = self.finished.send(());
+                    if let Some(watcher) = self.watcher.take() {
+                        let _ = watcher.join();
+                    }
+                }
+            }
+
+            fn run_bounded(runtime: &mut AcceptorRuntime) {
+                let _deadline = NativeRunDeadline::start();
+                runtime.run();
+            }
+
+            #[test]
+            fn native_recoverable_errors_retry_four_times_then_queue_one_deferred_packet() {
+                let _guard = ACCEPT_TEST_LOCK.lock().unwrap();
+                let _winsock = crate::native::Winsock::start().expect("Winsock");
+                for error in [64, 10_054, 10_053] {
+                    let mut runtime = acceptor(error, false);
+                    let identity = runtime.table.overlapped_ptr(0) as usize;
+                    let _deadline = NativeRunDeadline::start();
+                    let posted = runtime.post_accept(0);
+                    let state = runtime.core.state(0);
+                    let first = get_queued_completion_status(runtime.port.raw(), 0);
+                    let second = get_queued_completion_status(runtime.port.raw(), 0);
+                    // The direct post test consumes the real packet; retire its deferred ownership
+                    // before assertions. The next test exercises consumption by the native run loop.
+                    runtime.stop_admission();
+                    let stopped_action = runtime.core.on_ack(0);
+                    assert!(posted);
+                    assert_eq!(state, Some(AcceptState::Deferred));
+                    assert_eq!(runtime.statistics.network_errors, 4);
+                    assert!(first.succeeded);
+                    assert!(first.overlapped.is_null());
+                    assert_eq!(first.key, identity);
+                    assert!(!second.succeeded);
+                    assert_eq!(second.error, WAIT_TIMEOUT);
+                    assert_eq!(stopped_action, AcceptAction::None);
+                    assert!(!runtime.core.has_live());
+                    assert!(!runtime.failure.load(Ordering::Acquire));
+                    assert_eq!(runtime.operation_sockets[0].raw(), INVALID_SOCKET);
+                    assert_eq!(
+                        runtime
+                            .table
+                            .operation(0)
+                            .unwrap()
+                            .socket
+                            .load(Ordering::Acquire),
+                        INVALID_SOCKET
+                    );
+                    assert_probe_closed(4, identity);
+                }
+            }
+
+            #[test]
+            fn native_stop_consumes_deferred_repost_without_starting_a_fifth_accept() {
+                let _guard = ACCEPT_TEST_LOCK.lock().unwrap();
+                let _winsock = crate::native::Winsock::start().expect("Winsock");
+                for error in [64, 10_054, 10_053] {
+                    let mut runtime = acceptor(error, false);
+                    let identity = runtime.table.overlapped_ptr(0) as usize;
+                    // Stop precedes the deferred packet emitted during the initial four posts.
+                    post_completion(runtime.port.raw(), STOP_KEY, ptr::null_mut()).unwrap();
+                    run_bounded(&mut runtime);
+                    assert!(runtime.core.stopping);
+                    assert_eq!(runtime.core.state(0), Some(AcceptState::Idle));
+                    assert!(!runtime.core.has_live());
+                    assert!(!runtime.failure.load(Ordering::Acquire));
+                    assert_eq!(runtime.statistics.network_errors, 4);
+                    assert_probe_closed(4, identity);
+                    assert_empty_port(&runtime);
+                }
+            }
+
+            #[test]
+            fn native_pending_accept_stays_posted_until_stop_drains_its_completion() {
+                let _guard = ACCEPT_TEST_LOCK.lock().unwrap();
+                let _winsock = crate::native::Winsock::start().expect("Winsock");
+                let mut runtime = acceptor(ERROR_IO_PENDING, true);
+                let identity = runtime.table.overlapped_ptr(0) as usize;
+                post_completion(runtime.port.raw(), STOP_KEY, ptr::null_mut()).unwrap();
+                run_bounded(&mut runtime);
+                assert!(runtime.core.stopping);
+                assert!(!runtime.core.has_live());
+                assert_eq!(runtime.core.state(0), Some(AcceptState::Idle));
+                assert_eq!(runtime.statistics.network_errors, 0);
+                assert!(!runtime.failure.load(Ordering::Acquire));
+                ACCEPT_PROBE.with(|probe| assert!(probe.borrow().completion_posted));
+                assert_probe_closed(1, identity);
+                assert_empty_port(&runtime);
+            }
+
+            #[test]
+            fn native_deferred_packet_resumes_accept_before_later_stop() {
+                let _guard = ACCEPT_TEST_LOCK.lock().unwrap();
+                let _winsock = crate::native::Winsock::start().expect("Winsock");
+                for error in [64, 10_054, 10_053] {
+                    let mut runtime = acceptor(error, false);
+                    let identity = runtime.table.overlapped_ptr(0) as usize;
+                    // Four synchronous failures defer. Only the new accept started by consuming
+                    // that packet returns pending and queues stop followed by its completion.
+                    ACCEPT_PROBE.with(|probe| probe.borrow_mut().pending_after = Some(4));
+                    run_bounded(&mut runtime);
+                    assert!(runtime.core.stopping);
+                    assert!(!runtime.core.has_live());
+                    assert_eq!(runtime.statistics.network_errors, 4);
+                    assert!(!runtime.failure.load(Ordering::Acquire));
+                    ACCEPT_PROBE.with(|probe| assert!(probe.borrow().completion_posted));
+                    assert_probe_closed(5, identity);
+                    assert_empty_port(&runtime);
+                }
+            }
+
+            #[test]
+            fn native_fatal_synchronous_accept_error_closes_socket_and_stops_admission() {
+                let _guard = ACCEPT_TEST_LOCK.lock().unwrap();
+                let _winsock = crate::native::Winsock::start().expect("Winsock");
+                let mut runtime = acceptor(10_022, false);
+                let identity = runtime.table.overlapped_ptr(0) as usize;
+                run_bounded(&mut runtime);
+                assert!(runtime.core.stopping);
+                assert!(!runtime.core.has_live());
+                assert!(runtime.failure.load(Ordering::Acquire));
+                assert_eq!(runtime.statistics.network_errors, 1);
+                assert_probe_closed(1, identity);
+                assert_empty_port(&runtime);
             }
         }
     }

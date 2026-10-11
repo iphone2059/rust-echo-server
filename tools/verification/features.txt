@@ -2,3 +2,4 @@ tcp
 udp
 capacity
 admission
+notify-diagnostics
