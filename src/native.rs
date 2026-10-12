@@ -918,16 +918,22 @@ pub mod rio {
             }
             Ok(())
         }
+
+        /// Closes the port before the runtime releases its notification storage.
+        pub fn close(&mut self) {
+            if self.handle != INVALID_HANDLE_VALUE && !self.handle.is_null() {
+                unsafe {
+                    // The result is not actionable: the owner is being released either way.
+                    let _ = windows::Win32::handleapi::CloseHandle(self.handle);
+                }
+                self.handle = ptr::null_mut();
+            }
+        }
     }
 
     impl Drop for CompletionPort {
         fn drop(&mut self) {
-            if self.handle != INVALID_HANDLE_VALUE && !self.handle.is_null() {
-                unsafe {
-                    // The result is not actionable: the port is being dropped either way.
-                    let _ = windows::Win32::handleapi::CloseHandle(self.handle);
-                }
-            }
+            self.close();
         }
     }
 

@@ -48,6 +48,7 @@ pub struct TcpEngine {
     /// Set when a deadline could not be scheduled. Dropping a deadline would turn a
     /// timeout into a hang, so the worker fails fast instead.
     pub fatal: bool,
+    pub failure: Option<crate::types::Failure>,
 }
 
 impl TcpEngine {
@@ -68,6 +69,7 @@ impl TcpEngine {
             admission_closed: false,
             notification_armed: false,
             fatal: false,
+            failure: None,
         }
     }
 
@@ -146,6 +148,31 @@ impl TcpEngine {
         Some(Step::Receive { index, deadline })
     }
 
+    pub fn on_event(&mut self, event: crate::types::Event, now: u64) -> Option<Step> {
+        match event {
+            crate::types::Event::Completion(completion) => self.on_completion(
+                completion.index,
+                completion.operation,
+                completion.status,
+                completion.bytes,
+                now,
+            ),
+            crate::types::Event::PostFailed { index, failure } => {
+                self.failure = Some(failure);
+                self.on_post_failure_at(index, now)
+            }
+            crate::types::Event::AdmissionClosed => {
+                self.close_admission();
+                None
+            }
+            _ => {
+                self.fatal = true;
+                self.failure = Some(crate::types::Failure::invariant("TCP engine event"));
+                None
+            }
+        }
+    }
+
     /// A posted operation completed.
     pub fn on_completion(
         &mut self,
@@ -217,6 +244,10 @@ impl TcpEngine {
     /// connection can only be closed; this is the baseline's "failed post is a session
     /// failure, not a process failure" rule.
     pub fn on_post_failure(&mut self, index: u32) -> Option<Step> {
+        self.on_post_failure_at(index, 0)
+    }
+
+    fn on_post_failure_at(&mut self, index: u32, now: u64) -> Option<Step> {
         // A post the queue refused is a connection failure, exactly as the reference counts it on
         // this path: the session ends, but the server itself stays healthy.
         self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
@@ -230,7 +261,7 @@ impl TcpEngine {
             // The step that asked for this post already counted the operation, but RIO
             // never queued it, so the count has to come back down before the close.
             connection.outstanding = connection.outstanding.saturating_sub(1);
-            connection.close()
+            connection.close_at(now)
         };
         self.apply(index, step)
     }
@@ -238,46 +269,63 @@ impl TcpEngine {
     /// Closes every connection whose deadline passed. Returns the releases that were
     /// possible immediately; the rest arrive with their completions.
     pub fn on_timeout(&mut self, now: u64, expired: &mut Vec<u32>) -> Vec<Step> {
+        let mut steps = Vec::with_capacity(self.connections.len());
+        self.on_timeout_into(now, expired, &mut steps);
+        steps
+    }
+
+    pub fn on_timeout_into(&mut self, now: u64, expired: &mut Vec<u32>, steps: &mut Vec<Step>) {
         expired.clear();
         let count = self.timers.pop_expired(now, expired);
-        let mut steps = Vec::new();
+        steps.clear();
         for position in 0..count {
             let index = expired[position];
             let Some(connection) = self.connections.get_mut(index as usize) else {
                 self.fatal = true;
                 continue;
             };
-            if !connection.is_active() || connection.is_closing() {
+            if !connection.is_active() {
                 continue;
             }
-            let step = connection.close();
+            if connection.is_closing() {
+                if connection.outstanding != 0 {
+                    self.fatal = true;
+                    self.failure = Some(crate::types::Failure::timeout("server connection drain"));
+                }
+                continue;
+            }
+            let step = connection.close_at(now);
             if let Some(step) = self.apply(index, step) {
                 steps.push(step);
             }
         }
-        steps
     }
 
     /// Closes admission for this worker: no new socket is adopted and every live
     /// connection starts closing.
     pub fn begin_stop(&mut self) -> Vec<Step> {
+        let mut steps = Vec::with_capacity(self.connections.len());
+        self.begin_stop_into(0, &mut steps);
+        steps
+    }
+
+    pub fn begin_stop_into(&mut self, now: u64, steps: &mut Vec<Step>) {
+        steps.clear();
         if self.stopping {
-            return Vec::new();
+            return;
         }
         self.stopping = true;
         self.phase = WorkerPhase::Draining;
-        let mut steps = Vec::new();
         for index in 0..self.connections.len() as u32 {
             let is_active = self.connections[index as usize].is_active();
             if !is_active {
                 continue;
             }
-            let step = self.connections[index as usize].close();
+            let step = self.connections[index as usize].close_at(now);
             if let Some(step) = self.apply(index, step) {
                 steps.push(step);
             }
         }
-        steps
     }
 
     /// The admission barrier reached this worker.
@@ -336,7 +384,8 @@ impl TcpEngine {
                 })
             }
             ConnectionStep::Close => {
-                self.timers.remove(index);
+                let deadline = self.connections[index as usize].deadline;
+                self.schedule(index, deadline);
                 Some(Step::Close { index })
             }
             ConnectionStep::CloseAndRelease => {
@@ -442,7 +491,14 @@ mod tests {
             ConnectionState::Closing
         );
         assert_eq!(engine.active_count(), 2);
-        assert!(!engine.timers().contains(0));
+        // The close keeps a deadline of its own rather than clearing it. The cancelled receive can
+        // still be lost, and without a drain deadline nothing would ever notice: the slot would stay
+        // live forever. So the connection is scheduled again, at now + the drain grace, and that
+        // deadline is what reports a drain that never completes instead of hanging on it.
+        assert!(engine.timers().contains(0));
+        // Slot 1 is still due at 6_000, so that remains the next deadline; slot 0's drain deadline of
+        // 10_000 sits behind it in the heap.
+        assert_eq!(engine.waiting_milliseconds(5_000), 1_000);
 
         // The cancelled receive completes; only then is the slot released.
         assert_eq!(

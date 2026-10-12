@@ -709,11 +709,16 @@ pub mod connection {
             now: u64,
             timeout_milliseconds: u64,
         ) -> ConnectionStep {
-            debug_assert!(
-                self.outstanding > 0,
-                "completion without a posted operation"
-            );
-            self.outstanding = self.outstanding.saturating_sub(1);
+            // The baseline treats a completion with no posted operation as an invariant failure in
+            // every build, not only in debug: silently saturating here would hide a provider that
+            // completed twice, and the count is what decides when the slot may be released.
+            if self.outstanding == 0 {
+                crate::native::fail_fast(
+                    "server completion without provider ownership",
+                    crate::types::ERROR_INVALID_DATA,
+                );
+            }
+            self.outstanding -= 1;
             if self.state == ConnectionState::Closing {
                 // A socket closed with work in flight still has to be drained before the slot
                 // can be handed to a new connection. The socket is already closed, so the
@@ -725,13 +730,13 @@ pub mod connection {
                 };
             }
             if status != ERROR_SUCCESS {
-                return self.close();
+                return self.close_at(now);
             }
             match operation {
                 EngineOperation::Receive => {
                     // A zero-byte receive is an orderly shutdown from the peer.
                     if bytes == 0 {
-                        return self.close();
+                        return self.close_at(now);
                     }
                     self.echo_bytes = bytes;
                     self.send_offset = 0;
@@ -747,7 +752,7 @@ pub mod connection {
                     if !advance_offset_u32(self.echo_bytes, bytes, &mut self.send_offset) {
                         // A send that transferred nothing, or more than the echo, is a
                         // protocol failure: the echo cannot be completed.
-                        return self.close();
+                        return self.close_at(now);
                     }
                     if self.send_offset < self.echo_bytes {
                         ConnectionStep::Send {
@@ -764,6 +769,10 @@ pub mod connection {
 
         /// Closes the socket and, when nothing is in flight, releases the slot as well.
         pub fn close(&mut self) -> ConnectionStep {
+            self.close_at(0)
+        }
+
+        pub fn close_at(&mut self, now: u64) -> ConnectionStep {
             if self.state == ConnectionState::Closing
                 || self.state == ConnectionState::Released
                 || self.state == ConnectionState::Idle
@@ -771,7 +780,7 @@ pub mod connection {
                 return ConnectionStep::None;
             }
             self.state = ConnectionState::Closing;
-            self.deadline = 0;
+            self.deadline = now.saturating_add(5_000);
             if self.outstanding == 0 {
                 self.release()
             } else {
@@ -937,6 +946,21 @@ pub mod udp {
         None,
     }
 
+    pub type Event = crate::types::Event;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Action {
+        Post {
+            index: u32,
+            operation: EngineOperation,
+            payload_length: u32,
+        },
+        Fatal {
+            index: u32,
+            failure: crate::types::Failure,
+        },
+        None,
+    }
+
     pub struct UdpEngine {
         slots: Vec<UdpSlot>,
         payload_bytes: u32,
@@ -945,6 +969,7 @@ pub mod udp {
         pub statistics: Statistics,
         pub closing: bool,
         pub failed: bool,
+        pub failure: Option<crate::types::Failure>,
     }
 
     impl UdpEngine {
@@ -964,6 +989,7 @@ pub mod udp {
                 statistics: Statistics::default(),
                 closing: false,
                 failed: false,
+                failure: None,
             }
         }
 
@@ -976,11 +1002,103 @@ pub mod udp {
         }
 
         /// Records that the initial receive (or a repost) was accepted by RIO.
-        pub fn mark_posted(&mut self, index: u32) {
-            if let Some(slot) = self.slots.get_mut(index as usize) {
-                if !slot.outstanding {
-                    slot.outstanding = true;
-                    self.outstanding = self.outstanding.saturating_add(1);
+        pub fn mark_posted(&mut self, index: u32) -> bool {
+            if self.closing
+                || self.outstanding >= self.depth()
+                || self.slot(index).is_none_or(|slot| slot.outstanding)
+            {
+                self.failure = Some(crate::types::Failure::invariant("UDP post ownership"));
+                return false;
+            }
+            self.slots[index as usize].outstanding = true;
+            self.outstanding += 1;
+            true
+        }
+
+        pub fn lifecycle(&self) -> crate::types::UdpLifecycle {
+            crate::types::UdpLifecycle {
+                phase: self.phase,
+                outstanding: self.outstanding,
+                closing: self.closing,
+                failed: self.failed,
+            }
+        }
+
+        pub fn on_event_action(&mut self, event: Event) -> Action {
+            match self.on_event(event) {
+                UdpAction::Post { index } => {
+                    let slot = &self.slots[index as usize];
+                    Action::Post {
+                        index,
+                        operation: slot.operation,
+                        payload_length: slot.payload_length,
+                    }
+                }
+                UdpAction::Fatal { index, error } => Action::Fatal {
+                    index,
+                    failure: self.failure.unwrap_or(crate::types::Failure {
+                        classification: crate::types::FailureClass::Network,
+                        domain: crate::types::FailureDomain::Winsock,
+                        stage: "UDP RIO completion",
+                        code: error,
+                    }),
+                },
+                UdpAction::None => Action::None,
+            }
+        }
+
+        pub fn on_event(&mut self, event: crate::types::Event) -> UdpAction {
+            match event {
+                crate::types::Event::Completion(completion) => {
+                    if self
+                        .slot(completion.index)
+                        .is_none_or(|slot| slot.operation != completion.operation)
+                    {
+                        self.failure =
+                            Some(crate::types::Failure::invariant("UDP completion operation"));
+                        return UdpAction::Fatal {
+                            index: completion.index,
+                            error: ERROR_INVALID_DATA,
+                        };
+                    }
+                    self.on_completion(completion.index, completion.status, completion.bytes)
+                }
+                crate::types::Event::PostFailed { index, failure } => {
+                    if !self.on_post_failure(index) {
+                        UdpAction::Fatal {
+                            index,
+                            error: ERROR_INVALID_DATA,
+                        }
+                    } else {
+                        self.failure = Some(failure);
+                        UdpAction::Fatal {
+                            index,
+                            error: failure.code,
+                        }
+                    }
+                }
+                crate::types::Event::Stop => {
+                    self.begin_drain();
+                    UdpAction::None
+                }
+                crate::types::Event::GenerationDrained => {
+                    if self.outstanding != 0 || !self.closing {
+                        self.failure =
+                            Some(crate::types::Failure::invariant("UDP generation drain"));
+                        return UdpAction::Fatal {
+                            index: 0,
+                            error: ERROR_INVALID_DATA,
+                        };
+                    }
+                    self.stopped();
+                    UdpAction::None
+                }
+                _ => {
+                    self.failure = Some(crate::types::Failure::invariant("UDP engine event"));
+                    UdpAction::Fatal {
+                        index: 0,
+                        error: ERROR_INVALID_DATA,
+                    }
                 }
             }
         }
@@ -989,12 +1107,14 @@ pub mod udp {
         /// transferred byte count.
         pub fn on_completion(&mut self, index: u32, status: i32, bytes: u32) -> UdpAction {
             let Some(slot) = self.slots.get_mut(index as usize) else {
+                self.failure = Some(crate::types::Failure::invariant("UDP completion ownership"));
                 return UdpAction::Fatal {
                     index,
                     error: ERROR_INVALID_DATA,
                 };
             };
             if !slot.outstanding || self.outstanding == 0 {
+                self.failure = Some(crate::types::Failure::invariant("UDP completion ownership"));
                 return UdpAction::Fatal {
                     index,
                     error: ERROR_INVALID_DATA,
@@ -1056,19 +1176,18 @@ pub mod udp {
 
         /// The post for a slot was refused. The request never entered the queue, so the engine
         /// gives up on the socket and drains what is still in flight.
-        pub fn on_post_failure(&mut self, index: u32) {
-            self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
-            if let Some(slot) = self.slots.get_mut(index as usize) {
-                if slot.outstanding {
-                    // Defensive: a post that was counted and then refused must not stay counted.
-                    slot.outstanding = false;
-                    self.outstanding = self.outstanding.saturating_sub(1);
-                }
+        pub fn on_post_failure(&mut self, index: u32) -> bool {
+            if self.slot(index).is_none_or(|slot| slot.outstanding) {
+                self.failure = Some(crate::types::Failure::invariant(
+                    "UDP refused post already provider-owned",
+                ));
+                return false;
             }
+            self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
             self.failed = true;
             self.closing = true;
             self.phase = UdpPhase::Draining;
-            let _ = index;
+            true
         }
 
         /// Stop: close the socket so the outstanding requests are cancelled, and keep draining.
@@ -1220,7 +1339,8 @@ pub mod udp {
 
         #[test]
         fn a_refused_post_gives_up_on_the_socket() {
-            let mut engine = started(2);
+            let mut engine = UdpEngine::new(2, 65_507);
+            engine.mark_posted(1);
             engine.on_post_failure(0);
             assert!(engine.failed);
             assert!(engine.closing);
@@ -1244,7 +1364,7 @@ pub mod udp {
             engine.on_completion(0, 995, 0);
             engine.on_completion(1, WSAECONNRESET, 0);
             assert_eq!(engine.statistics.network_errors, 1);
-            let mut refused = started(1);
+            let mut refused = UdpEngine::new(1, 65_507);
             refused.on_post_failure(0);
             assert_eq!(refused.statistics.network_errors, 1);
         }
@@ -1281,7 +1401,7 @@ pub mod udp {
             ERROR_IO_INCOMPLETE, ERROR_NOT_ENOUGH_MEMORY, EngineOperation, ExitCode,
             NotifySnapshot, Options, Protocol, Statistics, UDP_ADDRESS_BYTES, WAIT_TIMEOUT,
         };
-        use crate::udp::{UdpAction, UdpEngine};
+        use crate::udp::{Action, UdpEngine};
 
         /// The RIO request context for one datagram slot. It is the record's first field, so the
         /// address RIO hands back is the record address.
@@ -1296,6 +1416,9 @@ pub mod udp {
             request: UdpRequest,
             payload: RIO_BUF,
             remote_address: RIO_BUF,
+            provider_operation: Option<EngineOperation>,
+            posted_length: u32,
+            capacity: u32,
         }
 
         impl UdpSlotRuntime {
@@ -1325,6 +1448,7 @@ pub mod udp {
             engine: UdpEngine,
             results: Vec<RIORESULT>,
             notification_counters: NotifySnapshot,
+            drain_deadline: Option<u64>,
         }
 
         impl UdpRuntime {
@@ -1368,6 +1492,9 @@ pub mod udp {
                         request: UdpRequest { slot_index: index },
                         payload: RIO_BUF::default(),
                         remote_address: RIO_BUF::default(),
+                        provider_operation: None,
+                        posted_length: 0,
+                        capacity: options.rio_buffer_bytes,
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
@@ -1398,6 +1525,7 @@ pub mod udp {
                     engine: UdpEngine::new(depth, options.rio_buffer_bytes),
                     results: vec![empty_result(); COMPLETION_BATCH_SIZE],
                     notification_counters: NotifySnapshot::default(),
+                    drain_deadline: None,
                 })
             }
 
@@ -1456,21 +1584,32 @@ pub mod udp {
             /// Posts the operation the slot currently holds: the echo of the datagram it received,
             /// or the next addressed receive.
             fn post_slot(&mut self, index: u32) {
+                let (operation, length) = {
+                    let slot = self
+                        .engine
+                        .slot(index)
+                        .unwrap_or_else(|| fail_fast("UDP post index", ERROR_INVALID_DATA));
+                    (slot.operation, slot.payload_length)
+                };
+                self.post_action(index, operation, length);
+            }
+
+            fn post_action(&mut self, index: u32, operation: EngineOperation, length: u32) {
                 let rio = self.rio;
                 let outcome = {
-                    let Some(slot) = self.slots.get_mut(index as usize) else {
-                        return;
-                    };
-                    let length = match self.engine.slot(index) {
-                        Some(state) => state.payload_length,
-                        None => 0,
-                    };
+                    let slot = self
+                        .slots
+                        .get_mut(index as usize)
+                        .unwrap_or_else(|| fail_fast("UDP post index", ERROR_INVALID_DATA));
+                    if length > slot.capacity {
+                        fail_fast("UDP post exceeds registration", ERROR_INVALID_DATA);
+                    }
+                    if slot.provider_operation.is_some() {
+                        fail_fast("UDP slot reuse", ERROR_INVALID_DATA);
+                    }
                     slot.payload.Length = length;
                     let context = slot.request_context();
-                    let send = matches!(
-                        self.engine.slot(index).map(|state| state.operation),
-                        Some(EngineOperation::Send)
-                    );
+                    let send = operation == EngineOperation::Send;
                     let queue = &self.request_queue;
                     if send {
                         queue.send_ex(&rio, &mut slot.payload, &mut slot.remote_address, context)
@@ -1479,18 +1618,146 @@ pub mod udp {
                     }
                 };
                 match outcome {
-                    Ok(()) => self.engine.mark_posted(index),
+                    Ok(()) => {
+                        self.slots[index as usize].provider_operation = Some(operation);
+                        self.slots[index as usize].posted_length = length;
+                        if !self.engine.mark_posted(index) {
+                            fail_fast("UDP post ownership", ERROR_INVALID_DATA);
+                        }
+                    }
                     Err(error) => {
-                        report(error.stage, error.code);
-                        self.engine.on_post_failure(index);
+                        let action = self
+                            .engine
+                            .on_event_action(crate::types::Event::PostFailed {
+                                index,
+                                failure: crate::types::Failure {
+                                    classification: crate::types::FailureClass::Network,
+                                    domain: crate::types::FailureDomain::Winsock,
+                                    stage: error.stage,
+                                    code: error.code,
+                                },
+                            });
+                        match action {
+                            Action::Fatal { failure, .. } => {
+                                if failure.classification != crate::types::FailureClass::Network {
+                                    fail_fast(failure.stage, failure.code);
+                                }
+                                report(failure.stage, failure.code);
+                                self.engine.on_event(crate::types::Event::Stop);
+                                if self.drain_deadline.is_none() {
+                                    self.drain_deadline =
+                                        Some(now_milliseconds().saturating_add(5_000));
+                                }
+                                self.socket.reset();
+                            }
+                            _ => fail_fast("UDP refused post action", ERROR_INVALID_DATA),
+                        }
                     }
                 }
             }
         }
 
-        impl Drop for UdpRuntime {
-            fn drop(&mut self) {
-                if self.engine.outstanding != 0 {
+        impl UdpRuntime {
+            // CQ retirement is independent of delivery of its armed IOCP notification.
+            fn drain_results(
+                &mut self,
+                stop: &Arc<AtomicBool>,
+                run_deadline: u64,
+                budget: u32,
+                mut records: Option<u32>,
+            ) {
+                let rio = self.rio;
+                for _ in 0..budget {
+                    // A saturated flood can keep the queue non-empty indefinitely, so the
+                    // bounded drain also observes the stop request and the run deadline: the
+                    // socket is closed here and no further request is reposted, which is what
+                    // keeps a controlled stop bounded under full load.
+                    if self.engine.closing
+                        || stop.load(Ordering::Acquire)
+                        || now_milliseconds() >= run_deadline
+                    {
+                        self.engine.begin_drain();
+                        if self.drain_deadline.is_none() {
+                            self.drain_deadline = Some(now_milliseconds().saturating_add(5_000));
+                        }
+                        self.socket.reset();
+                    }
+                    let capacity = records.map_or(self.results.len(), |remaining| {
+                        (remaining as usize).min(self.results.len())
+                    });
+                    if capacity == 0 {
+                        break;
+                    }
+                    let count = match self.queue.dequeue(&rio, &mut self.results[..capacity]) {
+                        Ok(count) => count,
+                        Err(error) => fail_fast("RIODequeueCompletion(UDP)", error.code),
+                    };
+                    if count == 0 {
+                        break;
+                    }
+                    if let Some(remaining) = &mut records {
+                        *remaining -= count;
+                    }
+                    for position in 0..count as usize {
+                        let result = self.results[position];
+                        let index = self.slot_index(result.RequestContext as usize);
+                        if self.engine.outstanding == 0
+                            || !self.engine.slot(index).is_some_and(|slot| slot.outstanding)
+                        {
+                            fail_fast("UDP completion invariant", ERROR_INVALID_DATA);
+                        }
+                        let slot = &mut self.slots[index as usize];
+                        let operation = slot.provider_operation.unwrap_or_else(|| {
+                            fail_fast(
+                                "UDP completion without provider ownership",
+                                ERROR_INVALID_DATA,
+                            )
+                        });
+                        if result.BytesTransferred > slot.posted_length {
+                            fail_fast("UDP completion exceeds posted range", ERROR_INVALID_DATA);
+                        }
+                        slot.provider_operation = None;
+                        slot.posted_length = 0;
+                        match self.engine.on_event_action(crate::types::Event::Completion(
+                            crate::types::Completion {
+                                index,
+                                operation,
+                                status: result.Status,
+                                bytes: result.BytesTransferred,
+                            },
+                        )) {
+                            Action::Post {
+                                index,
+                                operation,
+                                payload_length,
+                            } => self.post_action(index, operation, payload_length),
+                            Action::Fatal { failure, .. } => {
+                                // The engine gave up on the socket, so cancel the posted requests here as well
+                                // instead of leaving the drain to wait for completions the socket still holds.
+                                if failure.classification != crate::types::FailureClass::Network {
+                                    fail_fast(failure.stage, failure.code);
+                                }
+                                report(failure.stage, failure.code);
+                                self.engine.on_event(crate::types::Event::Stop);
+                                if self.drain_deadline.is_none() {
+                                    self.drain_deadline =
+                                        Some(now_milliseconds().saturating_add(5_000));
+                                }
+                                self.socket.reset();
+                            }
+                            Action::None => {}
+                        }
+                    }
+                }
+            }
+
+            fn release_resources(&mut self) {
+                if self.engine.outstanding != 0
+                    || self
+                        .slots
+                        .iter()
+                        .any(|slot| slot.provider_operation.is_some())
+                {
                     fail_fast(
                         "UDP cleanup with outstanding operations",
                         ERROR_IO_INCOMPLETE,
@@ -1500,6 +1767,12 @@ pub mod udp {
                 let rio = self.rio;
                 self.queue.close(&rio);
                 self.arena.destroy(&rio);
+                self.port.close();
+            }
+        }
+        impl Drop for UdpRuntime {
+            fn drop(&mut self) {
+                self.release_resources();
             }
         }
 
@@ -1543,7 +1816,9 @@ pub mod udp {
                         && bytes <= u64::from(u32::MAX)
                         && depth <= options.cq_capacity / 2 =>
                 {
-                    bytes
+                    // The rounded allocation must fit the budget; registrations cover exactly
+                    // the requested slots. VirtualAlloc supplies the page padding itself.
+                    u64::from(depth) * u64::from(stride)
                 }
                 _ => {
                     report("UDP queue/arena capacity", ERROR_NOT_ENOUGH_MEMORY);
@@ -1620,6 +1895,7 @@ pub mod udp {
                 runtime.arm(&mut armed);
             }
 
+            let mut overdue_budget: Option<usize> = None;
             while !runtime.engine.closing || runtime.engine.outstanding != 0 {
                 if runtime.engine.outstanding != 0 && !runtime.queue.is_armed() {
                     runtime.arm(&mut armed);
@@ -1631,10 +1907,43 @@ pub mod udp {
                 // socket, and a drain waiting for completions that can never arrive never ends. Both calls
                 // are idempotent, so running them while closing is safe.
                 if runtime.engine.closing || stop_now || expired {
-                    runtime.engine.begin_drain();
+                    runtime.engine.on_event(crate::types::Event::Stop);
+                    if runtime.drain_deadline.is_none() {
+                        runtime.drain_deadline = Some(now_milliseconds().saturating_add(5_000));
+                    }
                     runtime.socket.reset();
                 }
-                let packet = get_queued_completion_status(runtime.port.raw(), 100);
+                let now = now_milliseconds();
+                let due = runtime
+                    .drain_deadline
+                    .is_some_and(|deadline| now >= deadline);
+                if due {
+                    let remaining =
+                        overdue_budget.get_or_insert((depth as usize).saturating_add(1));
+                    if *remaining == 0 {
+                        runtime.drain_results(stop, run_deadline, depth, Some(depth));
+                        if runtime.engine.outstanding == 0 {
+                            break;
+                        }
+                        fail_fast("server UDP drain", 1460);
+                    }
+                    *remaining -= 1;
+                }
+                let wait = runtime
+                    .drain_deadline
+                    .map_or(100, |deadline| deadline.saturating_sub(now).min(100) as u32);
+                let packet = get_queued_completion_status(runtime.port.raw(), wait);
+                if due
+                    && !packet.succeeded
+                    && packet.error == WAIT_TIMEOUT
+                    && packet.overlapped.is_null()
+                {
+                    runtime.drain_results(stop, run_deadline, depth, Some(depth));
+                    if runtime.engine.outstanding == 0 {
+                        break;
+                    }
+                    fail_fast("server UDP drain", 1460);
+                }
                 if packet.overlapped as usize == runtime.notification_address() {
                     if !packet.succeeded {
                         fail_fast(
@@ -1659,54 +1968,7 @@ pub mod udp {
                     runtime.queue.on_delivery();
                     runtime.notification_counters.deliveries =
                         runtime.notification_counters.deliveries.wrapping_add(1);
-                    let rio = runtime.rio;
-                    for _ in 0..COMPLETION_DRAIN_BATCHES {
-                        // A saturated flood can keep the queue non-empty indefinitely, so the
-                        // bounded drain also observes the stop request and the run deadline: the
-                        // socket is closed here and no further request is reposted, which is what
-                        // keeps a controlled stop bounded under full load.
-                        if runtime.engine.closing
-                            || stop.load(Ordering::Acquire)
-                            || now_milliseconds() >= run_deadline
-                        {
-                            runtime.engine.begin_drain();
-                            runtime.socket.reset();
-                        }
-                        let count = match runtime.queue.dequeue(&rio, &mut runtime.results) {
-                            Ok(count) => count,
-                            Err(error) => fail_fast("RIODequeueCompletion(UDP)", error.code),
-                        };
-                        if count == 0 {
-                            break;
-                        }
-                        for position in 0..count as usize {
-                            let result = runtime.results[position];
-                            let index = runtime.slot_index(result.RequestContext as usize);
-                            if runtime.engine.outstanding == 0
-                                || !runtime
-                                    .engine
-                                    .slot(index)
-                                    .is_some_and(|slot| slot.outstanding)
-                            {
-                                fail_fast("UDP completion invariant", ERROR_INVALID_DATA);
-                            }
-                            match runtime.engine.on_completion(
-                                index,
-                                result.Status,
-                                result.BytesTransferred,
-                            ) {
-                                UdpAction::Post { index } => runtime.post_slot(index),
-                                UdpAction::Fatal { error, .. } => {
-                                    // The engine gave up on the socket, so cancel the posted requests here as well
-                                    // instead of leaving the drain to wait for completions the socket still holds.
-                                    report("UDP RIO completion", error);
-                                    runtime.engine.begin_drain();
-                                    runtime.socket.reset();
-                                }
-                                UdpAction::None => {}
-                            }
-                        }
-                    }
+                    runtime.drain_results(stop, run_deadline, COMPLETION_DRAIN_BATCHES, None);
                 } else if !packet.succeeded && packet.error != WAIT_TIMEOUT {
                     fail_fast("GetQueuedCompletionStatus(UDP)", packet.error as i32);
                 } else if !packet.succeeded
@@ -1810,6 +2072,8 @@ pub mod worker {
         socket: SocketOwner,
         request_queue: Option<RequestQueue>,
         buffer: RIO_BUF,
+        provider_operation: Option<EngineOperation>,
+        posted_length: u32,
     }
 
     impl ConnectionRuntime {
@@ -1820,6 +2084,9 @@ pub mod worker {
         /// Closes the socket and forgets the request queue. The engine has already returned
         /// the index to its free list, so nothing may post through this record any more.
         fn release(&mut self) {
+            if self.provider_operation.is_some() {
+                fail_fast("connection release with outstanding operation", 996);
+            }
             self.request_queue = None;
             self.socket.reset();
             self.buffer = RIO_BUF::default();
@@ -1864,6 +2131,7 @@ pub mod worker {
         failure: Arc<AtomicBool>,
         credits: Arc<AdmissionCredits>,
         notification_counters: NotifySnapshot,
+        ran: bool,
     }
     impl TcpWorker {
         /// Builds a worker: completion port, completion queue, registered arena and the
@@ -1927,6 +2195,8 @@ pub mod worker {
                     socket: SocketOwner::new(INVALID_SOCKET),
                     request_queue: None,
                     buffer: RIO_BUF::default(),
+                    provider_operation: None,
+                    posted_length: 0,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
@@ -1948,6 +2218,7 @@ pub mod worker {
                     worker: index,
                     ..NotifySnapshot::default()
                 },
+                ran: false,
             })
         }
 
@@ -1984,9 +2255,12 @@ pub mod worker {
             accept: &OnceLock<Arc<AcceptTable>>,
             ready: SendHandle,
         ) -> WorkerReport {
+            self.ran = true;
             if !set_ready(ready) {
                 fail_fast("SetEvent(worker ready)", 6);
             }
+            let mut expired = Vec::with_capacity(self.engine.slot_count() as usize);
+            let mut actions = Vec::with_capacity(self.engine.slot_count() as usize);
             loop {
                 // Lazy notification: a registration exists only while this worker owns
                 // connections with requests in flight, so an idle worker never holds a pending
@@ -1994,71 +2268,114 @@ pub mod worker {
                 // completion that arrives between the post and the arm cannot be lost.
                 self.maybe_arm();
                 let wait = self.engine.waiting_milliseconds(now_milliseconds());
-                let packet = get_queued_completion_status(self.port.raw(), wait);
-                if packet.overlapped as usize == self.notification_address() {
-                    if !packet.succeeded {
-                        fail_fast(
-                            "GetQueuedCompletionStatus(worker notification)",
-                            packet.error as i32,
-                        );
-                    }
-                    if !notification_packet_matches(
-                        packet.key,
-                        packet.overlapped as usize,
-                        self.key_address(),
-                        self.notification_address(),
-                    ) {
-                        fail_fast("server worker RIO notification key", ERROR_INVALID_DATA);
-                    }
-                    if !crate::contract::notification_mark_delivered(
-                        &mut self.engine.notification_armed,
-                    ) {
-                        fail_fast("server worker notification delivery transition", 5023);
-                    }
-                    self.queue.on_delivery();
-                    self.notification_counters.deliveries =
-                        self.notification_counters.deliveries.wrapping_add(1);
-                    self.drain(stop);
-                } else if packet.overlapped.is_null() && packet.key == STOP_KEY {
-                    let steps = self.engine.begin_stop();
-                    self.execute_all(steps);
-                } else if packet.overlapped.is_null() && packet.key == ADMISSION_CLOSED_KEY {
-                    self.engine.close_admission();
-                } else if packet.overlapped.is_null() && packet.key > ADMISSION_CLOSED_KEY {
-                    let Some(accept) = accept.get() else {
-                        fail_fast(
-                            "server accept handoff before table publication",
-                            ERROR_INVALID_DATA,
-                        );
-                    };
-                    self.take_socket(accept, packet.key);
-                } else if !packet.succeeded && packet.error != WAIT_TIMEOUT {
-                    report("GetQueuedCompletionStatus(worker)", packet.error as i32);
-                    self.engine.statistics.network_errors =
-                        self.engine.statistics.network_errors.wrapping_add(1);
-                    self.failure.store(true, Ordering::Release);
-                    let steps = self.engine.begin_stop();
-                    self.execute_all(steps);
-                } else if !packet.succeeded
-                    && packet.error == WAIT_TIMEOUT
-                    && packet.overlapped.is_null()
-                {
-                    if !self.engine.stopping
-                        && self.engine.outstanding() != 0
-                        && !self.engine.notification_armed
+                // A worker can have one notification per connection, every bounded accept
+                // handoff, and the stop/admission barriers queued ahead of its due completion.
+                let due_packet_budget = (self.engine.slot_count() as usize)
+                    .saturating_add(crate::contract::accept_operation_count(
+                        crate::types::MAXIMUM_WORKERS,
+                    ) as usize)
+                    .saturating_add(2);
+                let mut remaining = if wait == 0 { due_packet_budget } else { 1 };
+                let mut packet_wait = wait;
+                loop {
+                    let packet = get_queued_completion_status(self.port.raw(), packet_wait);
+                    let empty = !packet.succeeded
+                        && packet.error == WAIT_TIMEOUT
+                        && packet.overlapped.is_null();
+                    if packet.overlapped as usize == self.notification_address() {
+                        if !packet.succeeded {
+                            fail_fast(
+                                "GetQueuedCompletionStatus(worker notification)",
+                                packet.error as i32,
+                            );
+                        }
+                        if !notification_packet_matches(
+                            packet.key,
+                            packet.overlapped as usize,
+                            self.key_address(),
+                            self.notification_address(),
+                        ) {
+                            fail_fast("server worker RIO notification key", ERROR_INVALID_DATA);
+                        }
+                        if !crate::contract::notification_mark_delivered(
+                            &mut self.engine.notification_armed,
+                        ) {
+                            fail_fast("server worker notification delivery transition", 5023);
+                        }
+                        self.queue.on_delivery();
+                        self.notification_counters.deliveries =
+                            self.notification_counters.deliveries.wrapping_add(1);
+                        self.drain(stop);
+                    } else if packet.overlapped.is_null() && packet.key == STOP_KEY {
+                        self.engine
+                            .begin_stop_into(now_milliseconds(), &mut actions);
+                        self.execute_all(&actions);
+                    } else if packet.overlapped.is_null() && packet.key == ADMISSION_CLOSED_KEY {
+                        self.engine.close_admission();
+                    } else if packet.overlapped.is_null() && packet.key > ADMISSION_CLOSED_KEY {
+                        let Some(accept) = accept.get() else {
+                            fail_fast(
+                                "server accept handoff before table publication",
+                                ERROR_INVALID_DATA,
+                            );
+                        };
+                        self.take_socket(accept, packet.key);
+                    } else if !packet.succeeded && packet.error != WAIT_TIMEOUT {
+                        report("GetQueuedCompletionStatus(worker)", packet.error as i32);
+                        self.engine.statistics.network_errors =
+                            self.engine.statistics.network_errors.wrapping_add(1);
+                        self.failure.store(true, Ordering::Release);
+                        self.engine
+                            .begin_stop_into(now_milliseconds(), &mut actions);
+                        self.execute_all(&actions);
+                    } else if !packet.succeeded
+                        && packet.error == WAIT_TIMEOUT
+                        && packet.overlapped.is_null()
                     {
-                        self.notification_counters.timeout_wakeups =
-                            self.notification_counters.timeout_wakeups.wrapping_add(1);
+                        if !self.engine.stopping
+                            && self.engine.outstanding() != 0
+                            && !self.engine.notification_armed
+                        {
+                            self.notification_counters.timeout_wakeups =
+                                self.notification_counters.timeout_wakeups.wrapping_add(1);
+                        }
+                    } else {
+                        fail_fast("unexpected worker IOCP packet", ERROR_INVALID_DATA);
                     }
-                } else {
-                    fail_fast("unexpected worker IOCP packet", ERROR_INVALID_DATA);
+                    // The deadline may become due during the first blocking wait. Consume already
+                    // queued packets with zero wait before timer decisions; never renew the grace.
+                    if packet_wait != 0 && self.engine.waiting_milliseconds(now_milliseconds()) == 0
+                    {
+                        remaining = due_packet_budget;
+                    } else {
+                        remaining -= 1;
+                    }
+                    if (empty && packet_wait == 0) || remaining == 0 {
+                        break;
+                    }
+                    packet_wait = 0;
+                    self.maybe_arm();
                 }
                 if self.engine.fatal {
                     fail_fast("server timer insert/update", ERROR_INVALID_DATA);
                 }
-                let mut expired = Vec::new();
-                let steps = self.engine.on_timeout(now_milliseconds(), &mut expired);
-                self.execute_all(steps);
+                let arbitration = now_milliseconds();
+                if self.engine.waiting_milliseconds(arbitration) == 0 {
+                    // Native CQ results can precede delivery of their armed notification.
+                    // One operation per slot bounds even a sequence of one-entry dequeues.
+                    self.drain_bounded(stop, self.engine.slot_count(), false);
+                }
+                self.engine
+                    .on_timeout_into(arbitration, &mut expired, &mut actions);
+                if self.engine.fatal {
+                    if let Some(failure) = self.engine.failure.filter(|failure| {
+                        failure.classification != crate::types::FailureClass::Network
+                    }) {
+                        fail_fast(failure.stage, failure.code);
+                    }
+                    fail_fast("server timer invariant", ERROR_INVALID_DATA);
+                }
+                self.execute_all(&actions);
                 if self.engine.stopping
                     && self.engine.admission_closed
                     && self.engine.active_count() == 0
@@ -2068,16 +2385,6 @@ pub mod worker {
             }
             // At most one real RIONotify delivery may remain pending. The OVERLAPPED and
             // completion key stay allocated until the port closes; no synthetic packet is used.
-            if self.engine.outstanding() != 0
-                || !self.engine.may_exit()
-                || self.engine.free_count() != self.engine.slot_count()
-                || !self.credits.is_full()
-            {
-                fail_fast("server worker release precondition", 5023);
-            }
-            if cfg!(debug_assertions) && !self.notification_counters.valid() {
-                fail_fast("server worker notification accounting", 5023);
-            }
             self.engine.phase = WorkerPhase::Stopped;
             WorkerReport {
                 statistics: self.engine.statistics,
@@ -2089,7 +2396,29 @@ pub mod worker {
         /// queue, the registered region, the arena pages and finally the per-connection
         /// sockets. Only called after the loop has drained every connection and validated the
         /// release preconditions.
+        pub fn require_release(&self) {
+            if self.engine.outstanding() != 0
+                || self
+                    .connections
+                    .iter()
+                    .any(|connection| connection.provider_operation.is_some())
+            {
+                fail_fast("worker RIO cleanup with outstanding operations", 996);
+            }
+            if self.ran
+                && (!self.engine.may_exit()
+                    || self.engine.free_count() != self.engine.slot_count()
+                    || !self.credits.is_full())
+            {
+                fail_fast("server worker release precondition", 5023);
+            }
+            if cfg!(debug_assertions) && !self.notification_counters.valid() {
+                fail_fast("server worker notification accounting", 5023);
+            }
+        }
+
         pub fn destroy(mut self) {
+            self.require_release();
             let rio = self.rio;
             self.queue.close(&rio);
             self.arena.destroy(&rio);
@@ -2101,9 +2430,10 @@ pub mod worker {
 
     impl Drop for TcpWorker {
         fn drop(&mut self) {
-            if self.engine.outstanding() != 0 {
-                fail_fast("worker RIO cleanup with outstanding operations", 996);
+            if std::thread::panicking() {
+                fail_fast("server worker panic with native resources", 13);
             }
+            self.require_release();
             let rio = self.rio;
             self.queue.close(&rio);
             self.arena.destroy(&rio);
@@ -2143,29 +2473,61 @@ pub mod worker {
         /// non-empty indefinitely, so the drain yields to the control path after a fixed number
         /// of batches; whatever is left stays queued and the notification is re-armed later.
         fn drain(&mut self, stop: &Arc<AtomicBool>) {
+            self.drain_bounded(stop, COMPLETION_DRAIN_BATCHES, true);
+        }
+
+        fn drain_bounded(&mut self, stop: &Arc<AtomicBool>, budget: u32, yield_on_stop: bool) {
             let rio = self.rio;
-            for _ in 0..COMPLETION_DRAIN_BATCHES {
-                let count = match self.queue.dequeue(&rio, &mut self.results) {
+            let mut records = budget;
+            for _ in 0..budget {
+                let capacity = if yield_on_stop {
+                    self.results.len()
+                } else {
+                    (records as usize).min(self.results.len())
+                };
+                if capacity == 0 {
+                    return;
+                }
+                let count = match self.queue.dequeue(&rio, &mut self.results[..capacity]) {
                     Ok(count) => count,
                     Err(error) => fail_fast("RIODequeueCompletion(worker)", error.code),
                 };
                 if count == 0 {
                     return;
                 }
+                if !yield_on_stop {
+                    records -= count;
+                }
                 for position in 0..count as usize {
                     let result = self.results[position];
                     let index = self.request_index(result.RequestContext as usize);
-                    let operation = self.connections[index as usize].request.operation;
-                    let step = self.engine.on_completion(
-                        index,
-                        operation,
-                        result.Status,
-                        result.BytesTransferred,
+                    let runtime = &mut self.connections[index as usize];
+                    let operation = runtime.provider_operation.unwrap_or_else(|| {
+                        fail_fast(
+                            "worker completion without provider ownership",
+                            ERROR_INVALID_DATA,
+                        )
+                    });
+                    if operation != runtime.request.operation {
+                        fail_fast("worker completion operation", ERROR_INVALID_DATA);
+                    }
+                    if result.BytesTransferred > runtime.posted_length {
+                        fail_fast("worker completion exceeds posted range", ERROR_INVALID_DATA);
+                    }
+                    runtime.provider_operation = None;
+                    runtime.posted_length = 0;
+                    let step = self.engine.on_event(
+                        crate::types::Event::Completion(crate::types::Completion {
+                            index,
+                            operation,
+                            status: result.Status,
+                            bytes: result.BytesTransferred,
+                        }),
                         now_milliseconds(),
                     );
                     self.execute(step);
                 }
-                if stop.load(Ordering::Acquire) {
+                if yield_on_stop && stop.load(Ordering::Acquire) {
                     return;
                 }
             }
@@ -2190,14 +2552,21 @@ pub mod worker {
             index
         }
 
-        fn execute_all(&mut self, steps: Vec<Step>) {
-            for step in steps {
+        fn execute_all(&mut self, steps: &[Step]) {
+            for &step in steps {
                 self.execute(Some(step));
             }
         }
 
         fn execute(&mut self, step: Option<Step>) {
             if self.engine.fatal {
+                if let Some(failure) = self
+                    .engine
+                    .failure
+                    .filter(|failure| failure.classification != crate::types::FailureClass::Network)
+                {
+                    fail_fast(failure.stage, failure.code);
+                }
                 fail_fast("worker engine invariant", ERROR_INVALID_DATA);
             }
             match step {
@@ -2218,26 +2587,41 @@ pub mod worker {
             let rio = self.rio;
             let stride = self.stride;
             let outcome = {
-                let Some(runtime) = self.connections.get_mut(index as usize) else {
-                    return;
-                };
+                let runtime = self
+                    .connections
+                    .get_mut(index as usize)
+                    .unwrap_or_else(|| fail_fast("worker post index", ERROR_INVALID_DATA));
+                if runtime.provider_operation.is_some() {
+                    fail_fast("RIOReceive slot reuse", ERROR_INVALID_DATA);
+                }
                 runtime.request.operation = EngineOperation::Receive;
                 runtime.buffer.Offset = 0;
                 runtime.buffer.Length = stride;
                 let context = runtime.request_context();
                 match runtime.request_queue.as_ref() {
                     Some(queue) => queue.receive(&rio, &mut runtime.buffer, context),
-                    None => Err(NativeError {
-                        stage: "RIOReceive(missing request queue)",
-                        code: ERROR_INVALID_DATA,
-                    }),
+                    None => fail_fast("RIOReceive(missing request queue)", ERROR_INVALID_DATA),
                 }
             };
             if let Err(error) = outcome {
                 report(error.stage, error.code);
-                let step = self.engine.on_post_failure(index);
+                let step = self.engine.on_event(
+                    crate::types::Event::PostFailed {
+                        index,
+                        failure: crate::types::Failure {
+                            classification: crate::types::FailureClass::Network,
+                            domain: crate::types::FailureDomain::Winsock,
+                            stage: error.stage,
+                            code: error.code,
+                        },
+                    },
+                    now_milliseconds(),
+                );
                 self.execute(step);
             } else {
+                self.connections[index as usize].provider_operation =
+                    Some(EngineOperation::Receive);
+                self.connections[index as usize].posted_length = stride;
                 self.maybe_arm();
             }
         }
@@ -2250,26 +2634,40 @@ pub mod worker {
                 fail_fast("server send registration extent", ERROR_INVALID_DATA);
             }
             let outcome = {
-                let Some(runtime) = self.connections.get_mut(index as usize) else {
-                    return;
-                };
+                let runtime = self
+                    .connections
+                    .get_mut(index as usize)
+                    .unwrap_or_else(|| fail_fast("worker post index", ERROR_INVALID_DATA));
+                if runtime.provider_operation.is_some() {
+                    fail_fast("RIOSend slot reuse", ERROR_INVALID_DATA);
+                }
                 runtime.request.operation = EngineOperation::Send;
                 runtime.buffer.Offset = offset;
                 runtime.buffer.Length = length;
                 let context = runtime.request_context();
                 match runtime.request_queue.as_ref() {
                     Some(queue) => queue.send(&rio, &mut runtime.buffer, context),
-                    None => Err(NativeError {
-                        stage: "RIOSend(missing request queue)",
-                        code: ERROR_INVALID_DATA,
-                    }),
+                    None => fail_fast("RIOSend(missing request queue)", ERROR_INVALID_DATA),
                 }
             };
             if let Err(error) = outcome {
                 report(error.stage, error.code);
-                let step = self.engine.on_post_failure(index);
+                let step = self.engine.on_event(
+                    crate::types::Event::PostFailed {
+                        index,
+                        failure: crate::types::Failure {
+                            classification: crate::types::FailureClass::Network,
+                            domain: crate::types::FailureDomain::Winsock,
+                            stage: error.stage,
+                            code: error.code,
+                        },
+                    },
+                    now_milliseconds(),
+                );
                 self.execute(step);
             } else {
+                self.connections[index as usize].provider_operation = Some(EngineOperation::Send);
+                self.connections[index as usize].posted_length = length;
                 self.maybe_arm();
             }
         }
@@ -2459,6 +2857,7 @@ pub mod worker {
             socket_buffer_bytes: u32,
             failure: Arc<AtomicBool>,
             statistics: Statistics,
+            drain_deadline: Option<u64>,
         }
 
         // SAFETY: the acceptor runtime is created on the coordinator thread and moved into the
@@ -2561,6 +2960,7 @@ pub mod worker {
                     socket_buffer_bytes: options.socket_buffer_bytes,
                     failure,
                     statistics: Statistics::default(),
+                    drain_deadline: None,
                 })
             }
 
@@ -2671,6 +3071,9 @@ pub mod worker {
             /// Stops admission, closes the listener and unposts every operation that is still
             /// waiting; handoffs already in transit are awaited by the loop condition.
             fn stop_admission(&mut self) {
+                if self.drain_deadline.is_none() {
+                    self.drain_deadline = Some(now_milliseconds().saturating_add(5_000));
+                }
                 self.core.stop();
                 self.listener.reset();
                 for index in 0..self.core.operation_count() {
@@ -2687,11 +3090,19 @@ pub mod worker {
             }
         }
 
-        impl Drop for AcceptorRuntime {
-            fn drop(&mut self) {
+        impl AcceptorRuntime {
+            fn require_release(&self) {
                 if self.core.has_live() {
                     fail_fast("acceptor release with live operations", 996);
                 }
+            }
+        }
+        impl Drop for AcceptorRuntime {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    fail_fast("server acceptor panic with native resources", 13);
+                }
+                self.require_release();
                 for index in 0..self.core.operation_count() {
                     self.close_accept_socket(index);
                 }
@@ -2853,12 +3264,17 @@ pub mod worker {
                 thread::sleep(Duration::from_millis(10));
             }
 
+            let mut joined_acceptor = None;
             let mut statistics = if let Some((port, join)) = acceptor_control {
                 if let Err(error) = post_completion(port.0, STOP_KEY, ptr::null_mut()) {
                     fail_fast("PostQueuedCompletionStatus(acceptor stop)", error.code);
                 }
                 match join.join() {
-                    Ok(runtime) => runtime.statistics,
+                    Ok(runtime) => {
+                        let statistics = runtime.statistics;
+                        joined_acceptor = Some(runtime);
+                        statistics
+                    }
                     Err(_) => {
                         failure.store(true, Ordering::Release);
                         startup_statistics
@@ -2884,16 +3300,29 @@ pub mod worker {
             }
 
             let mut snapshots = Vec::with_capacity(controls.len());
+            let mut joined_workers = Vec::with_capacity(controls.len());
             let started_workers = controls.len() as u32;
             for control in controls {
                 match control.join.join() {
                     Ok((worker, report)) => {
                         statistics.merge(&report.statistics);
                         snapshots.push(report.notification);
-                        worker.destroy();
+                        joined_workers.push(worker);
                     }
                     Err(_) => failure.store(true, Ordering::Release),
                 }
+            }
+            // Retain the acceptor's native owner through every worker Join and the collective
+            // release checks, even though admission closes immediately after its Join.
+            if let Some(acceptor) = &joined_acceptor {
+                acceptor.require_release();
+            }
+            for worker in &joined_workers {
+                worker.require_release();
+            }
+            drop(joined_acceptor);
+            for worker in joined_workers {
+                worker.destroy();
             }
             crate::native::write_diagnostics(&snapshots, Protocol::Tcp);
             if options.stats {
@@ -2923,14 +3352,36 @@ pub mod worker {
                         break;
                     }
                 }
+                let mut overdue_budget: Option<usize> = None;
                 while !self.core.stopping || self.core.has_live() {
+                    let due = self
+                        .drain_deadline
+                        .is_some_and(|deadline| now_milliseconds() >= deadline)
+                        && self.core.has_live();
+                    if due {
+                        let remaining = overdue_budget.get_or_insert(
+                            (self.core.operation_count() as usize).saturating_add(1),
+                        );
+                        if *remaining == 0 {
+                            fail_fast("server acceptor drain", 1460);
+                        }
+                        *remaining -= 1;
+                    }
                     if !self.core.stopping && self.failure.load(Ordering::Acquire) {
                         self.stop_admission();
                         if !self.core.has_live() {
                             break;
                         }
                     }
-                    let packet = get_queued_completion_status(self.port.raw(), 100);
+                    let packet =
+                        get_queued_completion_status(self.port.raw(), if due { 0 } else { 100 });
+                    if due
+                        && !packet.succeeded
+                        && packet.error == WAIT_TIMEOUT
+                        && packet.overlapped.is_null()
+                    {
+                        fail_fast("server acceptor drain", 1460);
+                    }
                     if packet.overlapped.is_null() && packet.key == STOP_KEY {
                         self.stop_admission();
                         continue;
@@ -2968,6 +3419,14 @@ pub mod worker {
                         let index = operation.index;
                         if self.table.overlapped_ptr(index) != packet.overlapped {
                             fail_fast("server AcceptEx completion identity", ERROR_INVALID_DATA);
+                        }
+                        if self.core.state(index) != Some(AcceptState::Posted)
+                            || packet.transferred != 0
+                        {
+                            fail_fast(
+                                "server AcceptEx completion ownership/range",
+                                ERROR_INVALID_DATA,
+                            );
                         }
                         if !packet.succeeded {
                             self.close_accept_socket(index);
@@ -3228,6 +3687,7 @@ pub mod worker {
                     socket_buffer_bytes: 0,
                     failure: Arc::new(AtomicBool::new(false)),
                     statistics: Statistics::default(),
+                    drain_deadline: None,
                 }
             }
 

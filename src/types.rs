@@ -399,3 +399,71 @@ MiB_per_sec=11.72"
         assert!(!snapshot.valid());
     }
 }
+
+/// Failure metadata shared by pure engines and their runtimes. Native ownership faults are fatal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    Network,
+    Invariant,
+    DrainTimeout,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureDomain {
+    Win32,
+    Winsock,
+    Allocation,
+    Invariant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub classification: FailureClass,
+    pub domain: FailureDomain,
+    pub stage: &'static str,
+    pub code: i32,
+}
+
+impl Failure {
+    pub const fn invariant(stage: &'static str) -> Self {
+        Self {
+            classification: FailureClass::Invariant,
+            domain: FailureDomain::Invariant,
+            stage,
+            code: 13,
+        }
+    }
+    pub const fn timeout(stage: &'static str) -> Self {
+        Self {
+            classification: FailureClass::DrainTimeout,
+            domain: FailureDomain::Win32,
+            stage,
+            code: 1460,
+        }
+    }
+}
+
+/// Native completion metadata after the transport has retired its provider-owned request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Completion {
+    pub index: u32,
+    pub operation: EngineOperation,
+    pub status: i32,
+    pub bytes: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    Completion(Completion),
+    PostFailed { index: u32, failure: Failure },
+    Stop,
+    AdmissionClosed,
+    GenerationDrained,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdpLifecycle {
+    pub phase: UdpPhase,
+    pub outstanding: u32,
+    pub closing: bool,
+    pub failed: bool,
+}
