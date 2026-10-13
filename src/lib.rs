@@ -5,6 +5,9 @@
 //! worker runtimes, backed by `native` resource owners. Its public state modules are
 //! re-exported so the historical paths keep working.
 
+// Fallible Box/Arc initialization uses the installed Rust 1.101 nightly safe APIs.
+#![feature(allocator_ext)]
+
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")))]
 compile_error!("ces targets Windows x64 (x86_64-pc-windows-msvc) only");
 

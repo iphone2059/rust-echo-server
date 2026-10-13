@@ -118,13 +118,25 @@ pub mod acceptor {
     }
 
     impl AcceptorCore {
+        /// Cold convenience constructor; production initialization uses `try_new`.
         pub fn new(operation_count: u32, worker_count: u32) -> Self {
-            Self {
-                states: vec![AcceptState::Idle; operation_count as usize],
+            Self::try_new(operation_count, worker_count).expect("acceptor core allocation")
+        }
+
+        pub fn try_new(
+            operation_count: u32,
+            worker_count: u32,
+        ) -> Result<Self, crate::types::Failure> {
+            Ok(Self {
+                states: crate::types::try_vec_with(
+                    operation_count as usize,
+                    "acceptor state allocation",
+                    |_| AcceptState::Idle,
+                )?,
                 worker_count,
                 next_worker: 0,
                 stopping: false,
-            }
+            })
         }
 
         pub fn operation_count(&self) -> u32 {
@@ -148,7 +160,8 @@ pub mod acceptor {
                 .count() as u32
         }
 
-        /// Every slot that must be posted when the acceptor starts.
+        /// Every slot that must be posted when the acceptor starts. Cold convenience API;
+        /// the production loop traverses `operation_count` without allocating.
         pub fn initial_posts(&self) -> Vec<u32> {
             (0..self.states.len() as u32).collect()
         }
@@ -291,29 +304,40 @@ pub mod acceptor {
     unsafe impl Sync for AcceptTable {}
 
     impl AcceptTable {
+        /// Cold convenience constructor; production initialization uses `try_new`.
         pub fn new(operation_count: u32, port: crate::native::SendHandle) -> Self {
+            Self::try_new(operation_count, port).expect("AcceptEx table allocation")
+        }
+
+        pub fn try_new(
+            operation_count: u32,
+            port: crate::native::SendHandle,
+        ) -> Result<Self, crate::types::Failure> {
             let count = operation_count as usize;
-            let mut operations: Box<[AcceptOperation]> = (0..operation_count)
-                .map(|index| AcceptOperation {
+            let mut operations = crate::types::try_boxed_slice_with(
+                count,
+                "AcceptEx operation allocation",
+                |index| AcceptOperation {
                     overlapped: UnsafeCell::new(OVERLAPPED::default()),
                     socket: AtomicUsize::new(INVALID_SOCKET),
-                    index,
+                    index: index as u32,
                     owner: 0,
-                })
-                .collect();
+                },
+            )?;
             let identity = operations.as_ptr() as usize;
             for operation in operations.iter_mut() {
                 operation.owner = identity;
             }
-            let addresses = (0..count)
-                .map(|_| UnsafeCell::new([0u8; ACCEPT_OPERATION_BYTES]))
-                .collect();
-            Self {
+            let addresses =
+                crate::types::try_boxed_slice_with(count, "AcceptEx address allocation", |_| {
+                    UnsafeCell::new([0u8; ACCEPT_OPERATION_BYTES])
+                })?;
+            Ok(Self {
                 operations,
                 addresses,
                 identity,
                 port,
-            }
+            })
         }
 
         /// The acceptor's IOCP handle: the worker acknowledges a handoff by posting to it.
@@ -973,16 +997,23 @@ pub mod udp {
     }
 
     impl UdpEngine {
+        /// Cold convenience constructor; production initialization uses `try_new`.
         pub fn new(depth: u32, payload_bytes: u32) -> Self {
-            Self {
-                slots: (0..depth)
-                    .map(|index| UdpSlot {
-                        index,
+            Self::try_new(depth, payload_bytes).expect("UDP engine allocation")
+        }
+
+        pub fn try_new(depth: u32, payload_bytes: u32) -> Result<Self, crate::types::Failure> {
+            Ok(Self {
+                slots: crate::types::try_vec_with(
+                    depth as usize,
+                    "UDP engine allocation",
+                    |index| UdpSlot {
+                        index: index as u32,
                         operation: EngineOperation::Receive,
                         outstanding: false,
                         payload_length: payload_bytes,
-                    })
-                    .collect(),
+                    },
+                )?,
                 payload_bytes,
                 outstanding: 0,
                 phase: UdpPhase::Running,
@@ -990,7 +1021,7 @@ pub mod udp {
                 closing: false,
                 failed: false,
                 failure: None,
-            }
+            })
         }
 
         pub fn depth(&self) -> u32 {
@@ -1384,7 +1415,6 @@ pub mod udp {
         use core::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        use windows::Win32::minwinbase::OVERLAPPED;
         use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
 
         use crate::contract::checked_page_rounded_arena_bytes;
@@ -1394,12 +1424,14 @@ pub mod udp {
             get_queued_completion_status,
         };
         use crate::native::{
-            NativeError, RioFunctions, SocketOwner, fail_fast, now_milliseconds, report,
+            NativeError, NotificationStorage, RioFunctions, SocketOwner, fail_fast,
+            now_milliseconds, report,
         };
         use crate::types::{
-            COMPLETION_BATCH_SIZE, COMPLETION_DRAIN_BATCHES, ERROR_INVALID_DATA,
-            ERROR_IO_INCOMPLETE, ERROR_NOT_ENOUGH_MEMORY, EngineOperation, ExitCode,
-            NotifySnapshot, Options, Protocol, Statistics, UDP_ADDRESS_BYTES, WAIT_TIMEOUT,
+            COMPLETION_BATCH_SIZE, COMPLETION_DRAIN_BATCHES, ERROR_INSUFFICIENT_BUFFER,
+            ERROR_INVALID_DATA, ERROR_IO_INCOMPLETE, ERROR_NOT_ENOUGH_MEMORY, EngineOperation,
+            ExitCode, NotifySnapshot, Options, Protocol, Statistics, UDP_ADDRESS_BYTES,
+            WAIT_TIMEOUT,
         };
         use crate::udp::{Action, UdpEngine};
 
@@ -1443,7 +1475,7 @@ pub mod udp {
             arena: Arena,
             request_queue: RequestQueue,
             slots: Box<[UdpSlotRuntime]>,
-            notification: Box<OVERLAPPED>,
+            notification: NotificationStorage,
             key: Box<UdpKey>,
             engine: UdpEngine,
             results: Vec<RIORESULT>,
@@ -1462,44 +1494,78 @@ pub mod udp {
                 stride: u32,
             ) -> Result<Self, (NativeError, u64)> {
                 let depth = options.udp_depth;
-                let socket =
-                    crate::native::registered_socket(Protocol::Udp).map_err(|error| (error, 1))?;
+                let socket = crate::native::registered_socket(Protocol::Udp)
+                    .map_err(|error| (NativeError::code("WSASocketW(UDP RIO)", error.code), 1))?;
                 crate::native::configure_socket(socket.raw(), false, options.socket_buffer_bytes)
                     .map_err(|error| (error, 1))?;
                 crate::native::endpoint::bind_endpoint(socket.raw(), options.port)
-                    .map_err(|error| (error, 1))?;
-                let port = CompletionPort::create().map_err(|error| (error, 0))?;
-                let arena = Arena::create(&rio, arena_bytes, stride).map_err(|error| {
+                    .map_err(|error| (NativeError::code("bind(UDP)", error.code), 1))?;
+                let port = CompletionPort::create().map_err(|error| {
+                    (
+                        NativeError::code("CreateIoCompletionPort(UDP)", error.code),
+                        0,
+                    )
+                })?;
+                let mut arena = Arena::create(&rio, arena_bytes, stride).map_err(|error| {
                     // Arena combines VirtualAlloc and RIO registration. Only the latter
                     // counts as a network error in the baseline's UDP initialization.
                     let network_errors = u64::from(error.stage.starts_with("RIORegisterBuffer"));
-                    (error, network_errors)
+                    let stage = match error.stage {
+                        "VirtualAlloc(arena)" => "VirtualAlloc(UDP arena)",
+                        "arena registration allocation" => "UDP runtime allocation",
+                        _ if network_errors != 0 => "UDP slot registrations",
+                        _ => error.stage,
+                    };
+                    (NativeError::code(stage, error.code), network_errors)
                 })?;
-                let notification = Box::new(OVERLAPPED::default());
-                let key = Box::new(UdpKey {
-                    marker: 0x5544_5000_0000_0001,
-                });
-                let queue = CompletionQueue::create(
-                    &rio,
-                    &port,
-                    options.cq_capacity,
-                    &*key as *const UdpKey as *mut c_void,
-                    &*notification as *const OVERLAPPED as *mut c_void,
+                let allocation_error = |failure: crate::types::Failure| {
+                    (NativeError::code("UDP runtime allocation", failure.code), 0)
+                };
+                let mut notification = NotificationStorage::create("UDP runtime allocation")
+                    .map_err(allocation_error)?;
+                let key = crate::types::try_box(
+                    UdpKey {
+                        marker: 0x5544_5000_0000_0001,
+                    },
+                    "UDP runtime allocation",
                 )
-                .map_err(|error| (error, 1))?;
-                let slots: Box<[UdpSlotRuntime]> = (0..depth)
-                    .map(|index| UdpSlotRuntime {
-                        request: UdpRequest { slot_index: index },
+                .map_err(allocation_error)?;
+                let slots = crate::types::try_boxed_slice_with(
+                    depth as usize,
+                    "UDP runtime allocation",
+                    |index| UdpSlotRuntime {
+                        request: UdpRequest {
+                            slot_index: index as u32,
+                        },
                         payload: RIO_BUF::default(),
                         remote_address: RIO_BUF::default(),
                         provider_operation: None,
                         posted_length: 0,
                         capacity: options.rio_buffer_bytes,
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
+                    },
+                )
+                .map_err(allocation_error)?;
+                let engine = UdpEngine::try_new(depth, options.rio_buffer_bytes)
+                    .map_err(allocation_error)?;
+                let results = crate::types::try_vec_with(
+                    COMPLETION_BATCH_SIZE,
+                    "UDP runtime allocation",
+                    |_| empty_result(),
+                )
+                .map_err(allocation_error)?;
+                // Complete every Rust allocation before publishing the native notification
+                // address. No allocator failure can then destroy bound notification storage.
+                let mut queue = CompletionQueue::create(
+                    &rio,
+                    &port,
+                    options.cq_capacity,
+                    &*key as *const UdpKey as *mut c_void,
+                    notification.raw().cast(),
+                )
+                .map_err(|error| (NativeError::code("UDP RIO CQ creation", error.code), 1))?;
+                notification.bind();
                 let slots_context = slots.as_ptr() as *mut c_void;
-                let request_queue = RequestQueue::create(
+                let request_queue = match RequestQueue::create(
                     &rio,
                     socket.raw(),
                     depth,
@@ -1509,8 +1575,22 @@ pub mod udp {
                     queue.raw(),
                     queue.raw(),
                     slots_context,
-                )
-                .map_err(|error| (error, 1))?;
+                ) {
+                    Ok(request_queue) => request_queue,
+                    Err(error) => {
+                        // No request was accepted. Withdraw the CQ/IOCP registration
+                        // before the raw-owned notification packet can be destroyed.
+                        queue.close(&rio);
+                        arena.destroy(&rio);
+                        let mut port = port;
+                        port.close();
+                        notification.release_binding(&queue, &port);
+                        return Err((
+                            NativeError::code("RIOCreateRequestQueue(UDP)", error.code),
+                            1,
+                        ));
+                    }
+                };
 
                 Ok(Self {
                     rio,
@@ -1522,15 +1602,15 @@ pub mod udp {
                     slots,
                     notification,
                     key,
-                    engine: UdpEngine::new(depth, options.rio_buffer_bytes),
-                    results: vec![empty_result(); COMPLETION_BATCH_SIZE],
+                    engine,
+                    results,
                     notification_counters: NotifySnapshot::default(),
                     drain_deadline: None,
                 })
             }
 
             fn notification_address(&self) -> usize {
-                &*self.notification as *const OVERLAPPED as usize
+                self.notification.raw() as usize
             }
 
             fn key_address(&self) -> usize {
@@ -1560,7 +1640,7 @@ pub mod udp {
                 if self.queue.is_armed() {
                     fail_fast("server duplicate UDP RIONotify", ERROR_INVALID_DATA);
                 }
-                *self.notification = OVERLAPPED::default();
+                self.notification.clear();
                 let rio = self.rio;
                 if let Err(error) = self.queue.arm(&rio) {
                     fail_fast(
@@ -1591,10 +1671,16 @@ pub mod udp {
                         .unwrap_or_else(|| fail_fast("UDP post index", ERROR_INVALID_DATA));
                     (slot.operation, slot.payload_length)
                 };
-                self.post_action(index, operation, length);
+                self.post_action(index, operation, length, "RIOReceiveEx(UDP)");
             }
 
-            fn post_action(&mut self, index: u32, operation: EngineOperation, length: u32) {
+            fn post_action(
+                &mut self,
+                index: u32,
+                operation: EngineOperation,
+                length: u32,
+                failure_stage: &'static str,
+            ) {
                 let rio = self.rio;
                 let outcome = {
                     let slot = self
@@ -1633,7 +1719,7 @@ pub mod udp {
                                 failure: crate::types::Failure {
                                     classification: crate::types::FailureClass::Network,
                                     domain: crate::types::FailureDomain::Winsock,
-                                    stage: error.stage,
+                                    stage: failure_stage,
                                     code: error.code,
                                 },
                             });
@@ -1659,29 +1745,11 @@ pub mod udp {
 
         impl UdpRuntime {
             // CQ retirement is independent of delivery of its armed IOCP notification.
-            fn drain_results(
-                &mut self,
-                stop: &Arc<AtomicBool>,
-                run_deadline: u64,
-                budget: u32,
-                mut records: Option<u32>,
-            ) {
+            fn drain_results(&mut self, budget: u32, mut records: Option<u32>) {
                 let rio = self.rio;
                 for _ in 0..budget {
-                    // A saturated flood can keep the queue non-empty indefinitely, so the
-                    // bounded drain also observes the stop request and the run deadline: the
-                    // socket is closed here and no further request is reposted, which is what
-                    // keeps a controlled stop bounded under full load.
-                    if self.engine.closing
-                        || stop.load(Ordering::Acquire)
-                        || now_milliseconds() >= run_deadline
-                    {
-                        self.engine.begin_drain();
-                        if self.drain_deadline.is_none() {
-                            self.drain_deadline = Some(now_milliseconds().saturating_add(5_000));
-                        }
-                        self.socket.reset();
-                    }
+                    // Settle an acquired notification's bounded CQ drain before the outer
+                    // loop observes external stop or the run limit, matching the baseline.
                     let capacity = records.map_or(self.results.len(), |remaining| {
                         (remaining as usize).min(self.results.len())
                     });
@@ -1730,7 +1798,9 @@ pub mod udp {
                                 index,
                                 operation,
                                 payload_length,
-                            } => self.post_action(index, operation, payload_length),
+                            } => {
+                                self.post_action(index, operation, payload_length, "UDP RIO repost")
+                            }
                             Action::Fatal { failure, .. } => {
                                 // The engine gave up on the socket, so cancel the posted requests here as well
                                 // instead of leaving the drain to wait for completions the socket still holds.
@@ -1768,6 +1838,7 @@ pub mod udp {
                 self.queue.close(&rio);
                 self.arena.destroy(&rio);
                 self.port.close();
+                self.notification.release_binding(&self.queue, &self.port);
             }
         }
         impl Drop for UdpRuntime {
@@ -1787,7 +1858,10 @@ pub mod udp {
             cleanup: impl FnOnce(),
         ) -> ExitCode {
             if options.stats {
-                println!("{}", statistics.final_line(Protocol::Udp, elapsed, 1, 0));
+                crate::native::write_stdout(format_args!(
+                    "{}\n",
+                    statistics.display(Protocol::Udp, elapsed, 1, 0)
+                ));
             }
             cleanup();
             crate::native::write_diagnostics(&[snapshot], Protocol::Udp);
@@ -1805,23 +1879,23 @@ pub mod udp {
                 return ExitCode::Usage;
             };
             let depth = options.udp_depth;
+            if depth > options.cq_capacity / 2 {
+                report("UDP CQ capacity", ERROR_INSUFFICIENT_BUFFER);
+                return ExitCode::Usage;
+            }
             let arena_bytes = match checked_page_rounded_arena_bytes(
                 u64::from(depth),
                 u64::from(stride),
                 options.memory_bytes,
                 crate::native::page_bytes(),
             ) {
-                Some(bytes)
-                    if bytes > 0
-                        && bytes <= u64::from(u32::MAX)
-                        && depth <= options.cq_capacity / 2 =>
-                {
+                Some(bytes) if bytes > 0 && bytes <= u64::from(u32::MAX) => {
                     // The rounded allocation must fit the budget; registrations cover exactly
                     // the requested slots. VirtualAlloc supplies the page padding itself.
                     u64::from(depth) * u64::from(stride)
                 }
                 _ => {
-                    report("UDP queue/arena capacity", ERROR_NOT_ENOUGH_MEMORY);
+                    report("UDP registered arena", ERROR_NOT_ENOUGH_MEMORY);
                     return ExitCode::Usage;
                 }
             };
@@ -1921,7 +1995,7 @@ pub mod udp {
                     let remaining =
                         overdue_budget.get_or_insert((depth as usize).saturating_add(1));
                     if *remaining == 0 {
-                        runtime.drain_results(stop, run_deadline, depth, Some(depth));
+                        runtime.drain_results(depth, Some(depth));
                         if runtime.engine.outstanding == 0 {
                             break;
                         }
@@ -1938,7 +2012,7 @@ pub mod udp {
                     && packet.error == WAIT_TIMEOUT
                     && packet.overlapped.is_null()
                 {
-                    runtime.drain_results(stop, run_deadline, depth, Some(depth));
+                    runtime.drain_results(depth, Some(depth));
                     if runtime.engine.outstanding == 0 {
                         break;
                     }
@@ -1968,7 +2042,7 @@ pub mod udp {
                     runtime.queue.on_delivery();
                     runtime.notification_counters.deliveries =
                         runtime.notification_counters.deliveries.wrapping_add(1);
-                    runtime.drain_results(stop, run_deadline, COMPLETION_DRAIN_BATCHES, None);
+                    runtime.drain_results(COMPLETION_DRAIN_BATCHES, None);
                 } else if !packet.succeeded && packet.error != WAIT_TIMEOUT {
                     fail_fast("GetQueuedCompletionStatus(UDP)", packet.error as i32);
                 } else if !packet.succeeded
@@ -2011,9 +2085,7 @@ pub mod udp {
             finish_udp(options, statistics, elapsed, snapshot, failed, || {
                 // Release order of the baseline: completion queue, registration and arena, then
                 // the socket and port. Nothing is outstanding, so no completion can be lost.
-                let rio = runtime.rio;
-                runtime.queue.close(&rio);
-                runtime.arena.destroy(&rio);
+                runtime.release_resources();
                 drop(runtime);
             })
         }
@@ -2035,7 +2107,6 @@ pub mod worker {
     use core::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
 
-    use windows::Win32::minwinbase::OVERLAPPED;
     use windows::Win32::mswsockdef::{RIO_BUF, RIORESULT};
     use windows::Win32::winsock2::INVALID_SOCKET;
 
@@ -2048,7 +2119,8 @@ pub mod worker {
         post_completion,
     };
     use crate::native::{
-        NativeError, RioFunctions, SendHandle, SocketOwner, fail_fast, now_milliseconds, report,
+        HandleOwner, NativeError, NotificationStorage, RioFunctions, SendHandle, SocketOwner,
+        fail_fast, now_milliseconds, report,
     };
     use crate::types::{
         ADMISSION_CLOSED_KEY, COMPLETION_BATCH_SIZE, COMPLETION_DRAIN_BATCHES, ERROR_INVALID_DATA,
@@ -2108,7 +2180,10 @@ pub mod worker {
     // thread that owns it until it returns. Every native handle inside (completion port,
     // completion queue, registered arena, sockets) is used only by that owning thread; the
     // coordinator keeps a separate SendHandle copy of the port and only posts control packets
-    // to it.
+    // to it. Provider-visible request records and key live in fixed allocations; notification
+    // OVERLAPPED storage transfers into raw ownership before its pointer reaches RIO.
+    // moving this owner never changes their addresses. Return ownership carries no release check:
+    // the coordinator first joins all threads, then checks all owners, then releases resources.
     unsafe impl Send for TcpWorker {}
 
     /// What the coordinator reports for one worker after it has joined.
@@ -2123,7 +2198,7 @@ pub mod worker {
         port: CompletionPort,
         queue: CompletionQueue,
         arena: Arena,
-        notification: Box<OVERLAPPED>,
+        notification: NotificationStorage,
         key: Box<WorkerKey>,
         results: Vec<RIORESULT>,
         connections: Box<[ConnectionRuntime]>,
@@ -2132,6 +2207,8 @@ pub mod worker {
         credits: Arc<AdmissionCredits>,
         notification_counters: NotifySnapshot,
         ran: bool,
+        expired: Vec<u32>,
+        actions: Vec<Step>,
     }
     impl TcpWorker {
         /// Builds a worker: completion port, completion queue, registered arena and the
@@ -2147,6 +2224,33 @@ pub mod worker {
             memory_share: u64,
             timeout_milliseconds: u64,
             failure: Arc<AtomicBool>,
+        ) -> Result<Self, NativeError> {
+            let port = CompletionPort::create()
+                .map_err(|error| NativeError::code("CreateIoCompletionPort(worker)", error.code))?;
+            Self::create_with_port(
+                rio,
+                index,
+                slot_count,
+                stride,
+                cq_capacity,
+                memory_share,
+                timeout_milliseconds,
+                failure,
+                port,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn create_with_port(
+            rio: RioFunctions,
+            index: u32,
+            slot_count: u32,
+            stride: u32,
+            cq_capacity: u32,
+            memory_share: u64,
+            timeout_milliseconds: u64,
+            failure: Arc<AtomicBool>,
+            port: CompletionPort,
         ) -> Result<Self, NativeError> {
             if stride == 0 || slot_count == 0 {
                 return Err(NativeError {
@@ -2172,24 +2276,31 @@ pub mod worker {
             // Two queue entries per connection, exactly what the connection capacity reserved
             // out of /cq.
             let capacity = slot_count.checked_mul(2).unwrap_or(slot_count);
-            let port = CompletionPort::create()?;
-            let notification = Box::new(OVERLAPPED::default());
-            let key = Box::new(WorkerKey {
-                index,
-                marker: 0x574F_524B_0000_0000 | u64::from(index),
-            });
-            let queue = CompletionQueue::create(
-                &rio,
-                &port,
-                capacity.min(cq_capacity.max(1)),
-                &*key as *const WorkerKey as *mut c_void,
-                &*notification as *const OVERLAPPED as *mut c_void,
+            let mut notification = NotificationStorage::create("worker allocation")?;
+            let key = crate::types::try_box(
+                WorkerKey {
+                    index,
+                    marker: 0x574F_524B_0000_0000 | u64::from(index),
+                },
+                "worker allocation",
             )?;
-            let arena = Arena::create(&rio, arena_bytes as usize, stride)?;
-            let connections: Box<[ConnectionRuntime]> = (0..slot_count)
-                .map(|slot| ConnectionRuntime {
+            let arena = Arena::create(&rio, arena_bytes as usize, stride).map_err(|error| {
+                let stage = match error.stage {
+                    "VirtualAlloc(arena)" => "VirtualAlloc(worker arena)",
+                    "arena registration allocation" => "worker registration owners",
+                    stage if stage.starts_with("RIORegisterBuffer") => {
+                        "RIORegisterBuffer(worker slots)"
+                    }
+                    stage => stage,
+                };
+                NativeError::code(stage, error.code)
+            })?;
+            let connections = crate::types::try_boxed_slice_with(
+                slot_count as usize,
+                "worker allocation",
+                |slot| ConnectionRuntime {
                     request: Request {
-                        connection_index: slot,
+                        connection_index: slot as u32,
                         operation: EngineOperation::Receive,
                     },
                     socket: SocketOwner::new(INVALID_SOCKET),
@@ -2197,10 +2308,31 @@ pub mod worker {
                     buffer: RIO_BUF::default(),
                     provider_operation: None,
                     posted_length: 0,
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let engine = TcpEngine::new(slot_count, timeout_milliseconds);
+                },
+            )?;
+            let engine = TcpEngine::try_new(slot_count, timeout_milliseconds)
+                .map_err(|failure| NativeError::code("worker allocation", failure.code))?;
+            let results =
+                crate::types::try_vec_with(COMPLETION_BATCH_SIZE, "worker allocation", |_| {
+                    empty_result()
+                })?;
+            let credits =
+                crate::types::try_arc(AdmissionCredits::new(slot_count), "worker allocation")?;
+            let expired =
+                crate::types::try_vec_with_capacity(slot_count as usize, "worker allocation")?;
+            let actions =
+                crate::types::try_vec_with_capacity(slot_count as usize, "worker allocation")?;
+            // Complete all fallible allocation/registration work before CQ publication,
+            // matching the baseline's arena/table-before-CQ initialization order.
+            let queue = CompletionQueue::create(
+                &rio,
+                &port,
+                capacity.min(cq_capacity.max(1)),
+                &*key as *const WorkerKey as *mut c_void,
+                notification.raw().cast(),
+            )
+            .map_err(|error| NativeError::code("RIOCreateCompletionQueue(worker)", error.code))?;
+            notification.bind();
             Ok(Self {
                 rio,
                 stride,
@@ -2209,16 +2341,18 @@ pub mod worker {
                 arena,
                 notification,
                 key,
-                results: vec![empty_result(); COMPLETION_BATCH_SIZE],
+                results,
                 connections,
                 engine,
                 failure,
-                credits: Arc::new(AdmissionCredits::new(slot_count)),
+                credits,
                 notification_counters: NotifySnapshot {
                     worker: index,
                     ..NotifySnapshot::default()
                 },
                 ran: false,
+                expired,
+                actions,
             })
         }
 
@@ -2239,7 +2373,7 @@ pub mod worker {
         }
 
         fn notification_address(&self) -> usize {
-            &*self.notification as *const OVERLAPPED as usize
+            self.notification.raw() as usize
         }
 
         /// Marks the worker as running. The coordinator waits for the ready event, so this
@@ -2259,8 +2393,8 @@ pub mod worker {
             if !set_ready(ready) {
                 fail_fast("SetEvent(worker ready)", 6);
             }
-            let mut expired = Vec::with_capacity(self.engine.slot_count() as usize);
-            let mut actions = Vec::with_capacity(self.engine.slot_count() as usize);
+            let mut expired = core::mem::take(&mut self.expired);
+            let mut actions = core::mem::take(&mut self.actions);
             loop {
                 // Lazy notification: a registration exists only while this worker owns
                 // connections with requests in flight, so an idle worker never holds a pending
@@ -2386,6 +2520,8 @@ pub mod worker {
             // At most one real RIONotify delivery may remain pending. The OVERLAPPED and
             // completion key stay allocated until the port closes; no synthetic packet is used.
             self.engine.phase = WorkerPhase::Stopped;
+            self.expired = expired;
+            self.actions = actions;
             WorkerReport {
                 statistics: self.engine.statistics,
                 notification: self.notification_counters,
@@ -2417,7 +2553,15 @@ pub mod worker {
             }
         }
 
-        pub fn destroy(mut self) {
+        pub fn destroy(self) {
+            self.destroy_after_join(None);
+        }
+
+        fn destroy_with_ready(self, ready: HandleOwner) {
+            self.destroy_after_join(Some(ready));
+        }
+
+        fn destroy_after_join(mut self, ready: Option<HandleOwner>) {
             self.require_release();
             let rio = self.rio;
             self.queue.close(&rio);
@@ -2425,6 +2569,11 @@ pub mod worker {
             for runtime in self.connections.iter_mut() {
                 runtime.release();
             }
+            // The ready event is retained across all Joins and collective guards,
+            // then released after CQ/arena/socket owners and before this worker's port.
+            drop(ready);
+            self.port.close();
+            self.notification.release_binding(&self.queue, &self.port);
         }
     }
 
@@ -2437,6 +2586,8 @@ pub mod worker {
             let rio = self.rio;
             self.queue.close(&rio);
             self.arena.destroy(&rio);
+            self.port.close();
+            self.notification.release_binding(&self.queue, &self.port);
         }
     }
     impl TcpWorker {
@@ -2451,7 +2602,7 @@ pub mod worker {
             if self.queue.is_armed() {
                 fail_fast("server duplicate worker RIONotify", 5023);
             }
-            *self.notification = OVERLAPPED::default();
+            self.notification.clear();
             let rio = self.rio;
             if let Err(error) = self.queue.arm(&rio) {
                 fail_fast(
@@ -2793,7 +2944,9 @@ pub mod worker {
         use core::ptr;
         use core::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, OnceLock};
-        use std::thread::{self, JoinHandle};
+        use std::thread;
+        #[cfg(test)]
+        use std::thread::JoinHandle;
         use std::time::Duration;
 
         use windows::Win32::mswsock::{LPFN_ACCEPTEX, LPFN_GETACCEPTEXSOCKADDRS};
@@ -2810,9 +2963,9 @@ pub mod worker {
         use crate::native::endpoint::{bind_endpoint, listen_endpoint, update_accept_context};
         use crate::native::rio::{CompletionPort, get_queued_completion_status, post_completion};
         use crate::native::{
-            HandleOwner, RioFunctions, SendHandle, SocketOwner, active_processor_count,
-            configure_socket, fail_fast, load_accept_addresses, load_accept_ex, now_milliseconds,
-            registered_socket, report,
+            HandleOwner, NativeThread, RioFunctions, SendHandle, SocketOwner,
+            active_processor_count, configure_socket, fail_fast, load_accept_addresses,
+            load_accept_ex, now_milliseconds, registered_socket, report,
         };
         use crate::types::{
             ACCEPT_ADDRESS_BYTES, ADMISSION_CLOSED_KEY, ERROR_INVALID_DATA, ERROR_IO_PENDING,
@@ -2835,11 +2988,24 @@ pub mod worker {
         /// the coordinator collects.
         struct WorkerControl {
             port: SendHandle,
-            credits: Arc<AdmissionCredits>,
             // The worker borrows this event when announcing readiness; keep its owner
             // until the same thread has joined, including a readiness-wait failure.
             _ready: HandleOwner,
-            join: JoinHandle<(TcpWorker, WorkerReport)>,
+            join: NativeThread<WorkerThreadData>,
+        }
+
+        struct WorkerThreadData {
+            worker: TcpWorker,
+            stop: Arc<AtomicBool>,
+            table: Arc<OnceLock<Arc<AcceptTable>>>,
+            ready: SendHandle,
+            report: Option<WorkerReport>,
+        }
+
+        impl WorkerThreadData {
+            fn run(&mut self) {
+                self.report = Some(self.worker.run(&self.stop, &self.table, self.ready));
+            }
         }
 
         /// The acceptor runtime: listener, completion port, AcceptEx entry point and the
@@ -2878,7 +3044,7 @@ pub mod worker {
                 let listener = match registered_socket(Protocol::Tcp) {
                     Ok(listener) => listener,
                     Err(error) => {
-                        report(error.stage, error.code);
+                        report("WSASocketW(TCP listener)", error.code);
                         startup_statistics.network_errors =
                             startup_statistics.network_errors.wrapping_add(1);
                         return None;
@@ -2887,7 +3053,7 @@ pub mod worker {
                 let port = match CompletionPort::create() {
                     Ok(port) => port,
                     Err(error) => {
-                        report(error.stage, error.code);
+                        report("CreateIoCompletionPort(acceptor)", error.code);
                         startup_statistics.network_errors =
                             startup_statistics.network_errors.wrapping_add(1);
                         return None;
@@ -2902,19 +3068,19 @@ pub mod worker {
                     return None;
                 }
                 if let Err(error) = bind_endpoint(listener.raw(), options.port) {
-                    report(error.stage, error.code);
+                    report("bind/listen", error.code);
                     startup_statistics.network_errors =
                         startup_statistics.network_errors.wrapping_add(1);
                     return None;
                 }
                 if let Err(error) = listen_endpoint(listener.raw()) {
-                    report(error.stage, error.code);
+                    report("bind/listen", error.code);
                     startup_statistics.network_errors =
                         startup_statistics.network_errors.wrapping_add(1);
                     return None;
                 }
                 if let Err(error) = port.associate_socket(listener.raw()) {
-                    report(error.stage, error.code);
+                    report("CreateIoCompletionPort(listener association)", error.code);
                     startup_statistics.network_errors =
                         startup_statistics.network_errors.wrapping_add(1);
                     return None;
@@ -2942,13 +3108,28 @@ pub mod worker {
                     report("AcceptEx operation count", ERROR_NOT_ENOUGH_MEMORY);
                     return None;
                 }
-                let table = Arc::new(AcceptTable::new(operation_count, SendHandle(port.raw())));
-                let operation_sockets: Box<[SocketOwner]> = (0..operation_count)
-                    .map(|_| SocketOwner::new(INVALID_SOCKET))
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
+                let allocations = (|| -> Result<_, crate::types::Failure> {
+                    let table = crate::types::try_arc(
+                        AcceptTable::try_new(operation_count, SendHandle(port.raw()))?,
+                        "AcceptEx table allocation",
+                    )?;
+                    let operation_sockets = crate::types::try_boxed_slice_with(
+                        operation_count as usize,
+                        "AcceptEx socket allocation",
+                        |_| SocketOwner::new(INVALID_SOCKET),
+                    )?;
+                    let core = AcceptorCore::try_new(operation_count, worker_count)?;
+                    Ok((table, operation_sockets, core))
+                })();
+                let (table, operation_sockets, core) = match allocations {
+                    Ok(allocations) => allocations,
+                    Err(failure) => {
+                        report("AcceptEx operation allocation", failure.code);
+                        return None;
+                    }
+                };
                 Some(Self {
-                    core: AcceptorCore::new(operation_count, worker_count),
+                    core,
                     listener,
                     port,
                     accept_ex,
@@ -3015,7 +3196,7 @@ pub mod worker {
                     let socket = match registered_socket(Protocol::Tcp) {
                         Ok(socket) => socket,
                         Err(error) => {
-                            report(error.stage, error.code);
+                            report("WSASocketW(accepted RIO socket)", error.code);
                             self.statistics.network_errors =
                                 self.statistics.network_errors.wrapping_add(1);
                             return false;
@@ -3085,6 +3266,10 @@ pub mod worker {
 
             fn fail_admission(&mut self, stage: &str, error: i32) {
                 report(stage, error);
+                self.stop_failed();
+            }
+
+            fn stop_failed(&mut self) {
                 self.failure.store(true, Ordering::Release);
                 self.stop_admission();
             }
@@ -3117,14 +3302,43 @@ pub mod worker {
         pub fn run_tcp(rio: RioFunctions, options: &Options, stop: &Arc<AtomicBool>) -> ExitCode {
             let worker_count =
                 resolved_worker_count(options.worker_count, active_processor_count());
-            let failure = Arc::new(AtomicBool::new(false));
             let stride = tcp_stride(options.rio_buffer_bytes);
             let page = crate::native::page_bytes();
             let timeout_milliseconds = u64::from(options.timeout_seconds) * 1_000;
             // Idle workers do not need the table. Publish it once all workers have
             // announced readiness, before the acceptor can issue the first handoff.
-            let table: Arc<OnceLock<Arc<AcceptTable>>> = Arc::new(OnceLock::new());
-            let mut controls: Vec<WorkerControl> = Vec::with_capacity(worker_count as usize);
+            // Every coordinator collection, including Join results and reporting storage,
+            // reserves its final capacity before the first worker can own native I/O.
+            let allocations = (|| -> Result<_, crate::types::Failure> {
+                let count = worker_count as usize;
+                let stage = "worker array allocation";
+                Ok((
+                    crate::types::try_arc(AtomicBool::new(false), stage)?,
+                    crate::types::try_arc(OnceLock::<Arc<AcceptTable>>::new(), stage)?,
+                    crate::types::try_vec_with_capacity::<WorkerControl>(count, stage)?,
+                    crate::types::try_vec_with_capacity::<SendHandle>(count, stage)?,
+                    crate::types::try_vec_with_capacity::<Arc<AdmissionCredits>>(count, stage)?,
+                    crate::types::try_vec_with_capacity::<crate::types::NotifySnapshot>(
+                        count, stage,
+                    )?,
+                    crate::types::try_vec_with_capacity::<TcpWorker>(count, stage)?,
+                ))
+            })();
+            let (
+                failure,
+                table,
+                mut controls,
+                mut ports,
+                mut credits,
+                mut snapshots,
+                mut joined_workers,
+            ) = match allocations {
+                Ok(allocations) => allocations,
+                Err(failure) => {
+                    report(failure.stage, failure.code);
+                    return ExitCode::Network;
+                }
+            };
 
             // Initialize, start and wait for each worker before creating the next one.
             // A later failure still stops and joins every thread that already started.
@@ -3137,22 +3351,33 @@ pub mod worker {
                     memory_share / u64::from(stride)
                 };
                 let slot_count = tcp_connection_capacity(options.cq_capacity, possible_slots);
+                // Both native objects are attempted before choosing the diagnostic,
+                // and a failed IOCP takes precedence over a failed ready event.
+                let port = CompletionPort::create();
+                let ready = HandleOwner::new(unsafe {
+                    windows::Win32::synchapi::CreateEventW(None, true, false, None)
+                });
+                let ready_error = (!ready.is_open())
+                    .then(|| crate::native::NativeError::last("CreateEventW(worker ready)"));
+                let port = match port {
+                    Ok(port) => port,
+                    Err(error) => {
+                        report("CreateIoCompletionPort(worker)", error.code);
+                        failure.store(true, Ordering::Release);
+                        break;
+                    }
+                };
+                if let Some(error) = ready_error {
+                    report(error.stage, error.code);
+                    failure.store(true, Ordering::Release);
+                    break;
+                }
                 if possible_slots == 0 || slot_count == 0 {
                     report("worker registered arena capacity", ERROR_NOT_ENOUGH_MEMORY);
                     failure.store(true, Ordering::Release);
                     break;
                 }
-                let ready = HandleOwner::new(unsafe {
-                    windows::Win32::synchapi::CreateEventW(None, true, false, None)
-                });
-                if !ready.is_open() {
-                    // The failure code is captured here: a later Win32 call would overwrite it.
-                    let error = crate::native::NativeError::last("CreateEvent(worker ready)");
-                    report(error.stage, error.code);
-                    failure.store(true, Ordering::Release);
-                    break;
-                }
-                let mut worker = match TcpWorker::create(
+                let mut worker = match TcpWorker::create_with_port(
                     rio,
                     index,
                     slot_count,
@@ -3161,6 +3386,7 @@ pub mod worker {
                     memory_share,
                     timeout_milliseconds,
                     Arc::clone(&failure),
+                    port,
                 ) {
                     Ok(worker) => worker,
                     Err(error) => {
@@ -3174,26 +3400,30 @@ pub mod worker {
                 let stop_clone = Arc::clone(stop);
                 let table_clone = Arc::clone(&table);
                 let port = worker.port_handle();
-                let credits = worker.admission_credits();
-                let join = thread::Builder::new().spawn(move || {
-                    let mut worker = worker;
-                    let report = worker.run(&stop_clone, &table_clone, ready_handle);
-                    // Return ownership, keeping the port and notification storage alive until
-                    // the coordinator has finished publishing control packets and joined us.
-                    (worker, report)
-                });
+                let worker_credits = worker.admission_credits();
+                let join = NativeThread::spawn(
+                    WorkerThreadData {
+                        worker,
+                        stop: stop_clone,
+                        table: table_clone,
+                        ready: ready_handle,
+                        report: None,
+                    },
+                    WorkerThreadData::run,
+                    "CreateThread(worker)",
+                );
                 match join {
-                    Ok(join) => controls.push(WorkerControl {
-                        port,
-                        credits,
-                        _ready: ready,
-                        join,
-                    }),
+                    Ok(join) => {
+                        ports.push(port);
+                        credits.push(worker_credits);
+                        controls.push(WorkerControl {
+                            port,
+                            _ready: ready,
+                            join,
+                        });
+                    }
                     Err(error) => {
-                        report(
-                            "CreateThread(worker)",
-                            error.raw_os_error().unwrap_or(ERROR_NOT_ENOUGH_MEMORY),
-                        );
+                        report(error.stage, error.code);
                         failure.store(true, Ordering::Release);
                         break;
                     }
@@ -3202,7 +3432,7 @@ pub mod worker {
                     windows::Win32::synchapi::WaitForSingleObject(ready_handle.0, u32::MAX)
                 };
                 if status != crate::types::WAIT_OBJECT_0 {
-                    report("worker startup readiness", ERROR_INVALID_DATA);
+                    report("worker startup readiness", 5023);
                     failure.store(true, Ordering::Release);
                     break;
                 }
@@ -3214,11 +3444,6 @@ pub mod worker {
             let mut acceptor_control = None;
             let mut startup_statistics = Statistics::default();
             if !failure.load(Ordering::Acquire) {
-                let ports = controls.iter().map(|control| control.port).collect();
-                let credits = controls
-                    .iter()
-                    .map(|control| Arc::clone(&control.credits))
-                    .collect();
                 match AcceptorRuntime::initialize(
                     options,
                     worker_count,
@@ -3227,23 +3452,19 @@ pub mod worker {
                     Arc::clone(&failure),
                     &mut startup_statistics,
                 ) {
-                    Some(mut runtime) => {
+                    Some(runtime) => {
                         if table.set(runtime.table()).is_err() {
                             fail_fast("server accept table publication", ERROR_INVALID_DATA);
                         }
                         let port = runtime.port_handle();
-                        match thread::Builder::new().spawn(move || {
-                            runtime.run();
-                            // Keep the port and operation table alive until the coordinator
-                            // has published stop and joined the acceptor.
-                            runtime
-                        }) {
+                        match NativeThread::spawn(
+                            runtime,
+                            AcceptorRuntime::run,
+                            "CreateThread(acceptor)",
+                        ) {
                             Ok(join) => acceptor_control = Some((port, join)),
                             Err(error) => {
-                                report(
-                                    "CreateThread(acceptor)",
-                                    error.raw_os_error().unwrap_or(ERROR_NOT_ENOUGH_MEMORY),
-                                );
+                                report(error.stage, error.code);
                                 failure.store(true, Ordering::Release);
                             }
                         }
@@ -3265,21 +3486,14 @@ pub mod worker {
             }
 
             let mut joined_acceptor = None;
-            let mut statistics = if let Some((port, join)) = acceptor_control {
+            let mut statistics = if let Some((port, join)) = &mut acceptor_control {
                 if let Err(error) = post_completion(port.0, STOP_KEY, ptr::null_mut()) {
                     fail_fast("PostQueuedCompletionStatus(acceptor stop)", error.code);
                 }
-                match join.join() {
-                    Ok(runtime) => {
-                        let statistics = runtime.statistics;
-                        joined_acceptor = Some(runtime);
-                        statistics
-                    }
-                    Err(_) => {
-                        failure.store(true, Ordering::Release);
-                        startup_statistics
-                    }
-                }
+                let runtime = join.join();
+                let statistics = runtime.statistics;
+                joined_acceptor = Some(runtime);
+                statistics
             } else {
                 // Listener, bind/listen, IOCP and extension-loading failures are acceptor
                 // network errors even when no acceptor thread was started.
@@ -3299,18 +3513,15 @@ pub mod worker {
                 }
             }
 
-            let mut snapshots = Vec::with_capacity(controls.len());
-            let mut joined_workers = Vec::with_capacity(controls.len());
             let started_workers = controls.len() as u32;
-            for control in controls {
-                match control.join.join() {
-                    Ok((worker, report)) => {
-                        statistics.merge(&report.statistics);
-                        snapshots.push(report.notification);
-                        joined_workers.push(worker);
-                    }
-                    Err(_) => failure.store(true, Ordering::Release),
-                }
+            for control in &mut controls {
+                let data = control.join.join();
+                let Some(report) = data.report else {
+                    fail_fast("server worker result publication", ERROR_INVALID_DATA);
+                };
+                statistics.merge(&report.statistics);
+                snapshots.push(report.notification);
+                joined_workers.push(data.worker);
             }
             // Retain the acceptor's native owner through every worker Join and the collective
             // release checks, even though admission closes immediately after its Join.
@@ -3320,21 +3531,29 @@ pub mod worker {
             for worker in &joined_workers {
                 worker.require_release();
             }
+            drop(acceptor_control);
             drop(joined_acceptor);
-            for worker in joined_workers {
-                worker.destroy();
+            for (control, worker) in controls.into_iter().zip(joined_workers) {
+                // Baseline order: thread handle, CQ/arena/socket owners, ready event, IOCP.
+                let WorkerControl {
+                    join,
+                    _ready: ready,
+                    ..
+                } = control;
+                drop(join);
+                worker.destroy_with_ready(ready);
             }
             crate::native::write_diagnostics(&snapshots, Protocol::Tcp);
             if options.stats {
-                println!(
-                    "{}",
-                    statistics.final_line(
+                crate::native::write_stdout(format_args!(
+                    "{}\n",
+                    statistics.display(
                         Protocol::Tcp,
                         now_milliseconds().saturating_sub(start),
                         started_workers,
                         0
                     )
-                );
+                ));
             }
             if failure.load(Ordering::Acquire) {
                 ExitCode::Network
@@ -3346,9 +3565,9 @@ pub mod worker {
         impl AcceptorRuntime {
             /// Runs the acceptor loop until it stops and every operation has been recycled.
             fn run(&mut self) {
-                for index in self.core.initial_posts() {
+                for index in 0..self.core.operation_count() {
                     if !self.post_accept(index) {
-                        self.fail_admission("AcceptEx(initial)", ERROR_INVALID_DATA);
+                        self.stop_failed();
                         break;
                     }
                 }
@@ -3402,7 +3621,7 @@ pub mod worker {
                         match self.core.on_ack(index) {
                             AcceptAction::Repost { index } => {
                                 if !self.post_accept(index) {
-                                    self.fail_admission("AcceptEx(repost)", ERROR_INVALID_DATA);
+                                    self.stop_failed();
                                 }
                             }
                             AcceptAction::None => {}
@@ -3441,10 +3660,7 @@ pub mod worker {
                         {
                             AcceptAction::Repost { index } => {
                                 if !self.post_accept(index) {
-                                    self.fail_admission(
-                                        "AcceptEx(repost after reset)",
-                                        ERROR_INVALID_DATA,
-                                    );
+                                    self.stop_failed();
                                 }
                             }
                             AcceptAction::Handoff { index, worker } => {
@@ -3453,26 +3669,17 @@ pub mod worker {
                                     HandoffOutcome::Withdrawn => {
                                         // The acceptor closed this socket while unposting (a stop raced
                                         // the completion); the slot goes back to idle and admission
-                                        // stays healthy unless it was not stopping.
+                                        // is closed without an additional diagnostic.
                                         self.core.abort_handoff(index);
-                                        if !self.core.stopping {
-                                            self.fail_admission(
-                                                "AcceptEx handoff withdrawn",
-                                                ERROR_INVALID_DATA,
-                                            );
-                                        }
                                     }
                                     HandoffOutcome::Failed => {
                                         self.core.abort_handoff(index);
-                                        self.fail_admission("AcceptEx handoff", ERROR_INVALID_DATA);
+                                        self.stop_failed();
                                     }
                                     HandoffOutcome::Rejected => {
                                         self.core.abort_handoff(index);
                                         if !self.post_accept(index) {
-                                            self.fail_admission(
-                                                "AcceptEx(repost after capacity rejection)",
-                                                ERROR_INVALID_DATA,
-                                            );
+                                            self.stop_failed();
                                         }
                                     }
                                 }
@@ -3512,9 +3719,8 @@ pub mod worker {
                     return HandoffOutcome::Withdrawn;
                 }
                 self.table.store_socket(index, socket);
-                if let Err(error) = update_accept_context(socket, self.listener.raw()) {
+                if update_accept_context(socket, self.listener.raw()).is_err() {
                     self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
-                    report(error.stage, error.code);
                     self.close_accept_socket(index);
                     return HandoffOutcome::Failed;
                 }
@@ -3895,13 +4101,24 @@ pub mod worker {
         }
 
         impl TimerHeap {
+            /// Cold convenience constructor; production initialization uses `try_new`.
             pub fn new(capacity: usize) -> Self {
-                Self {
+                Self::try_new(capacity).expect("timer allocation")
+            }
+
+            pub fn try_new(capacity: usize) -> Result<Self, crate::types::Failure> {
+                Ok(Self {
                     capacity,
                     size: 0,
-                    nodes: vec![TimerNode::default(); capacity],
-                    positions: vec![-1; capacity],
-                }
+                    nodes: crate::types::try_vec_with(capacity, "timer node allocation", |_| {
+                        TimerNode::default()
+                    })?,
+                    positions: crate::types::try_vec_with(
+                        capacity,
+                        "timer position allocation",
+                        |_| -1,
+                    )?,
+                })
             }
 
             pub fn capacity(&self) -> usize {

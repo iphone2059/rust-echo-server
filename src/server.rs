@@ -26,7 +26,7 @@ pub fn run_server(options: &Options, stop_requested: &Arc<AtomicBool>) -> ExitCo
     let probe = match registered_socket(Protocol::Tcp) {
         Ok(probe) => probe,
         Err(error) => {
-            report(error.stage, error.code);
+            report("WSASocketW(RIO probe)", error.code);
             return ExitCode::Network;
         }
     };

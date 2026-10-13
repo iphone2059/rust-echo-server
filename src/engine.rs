@@ -52,13 +52,26 @@ pub struct TcpEngine {
 }
 
 impl TcpEngine {
+    /// Cold convenience constructor; production initialization uses `try_new`.
     pub fn new(slot_count: u32, timeout_milliseconds: u64) -> Self {
+        Self::try_new(slot_count, timeout_milliseconds).expect("TCP engine allocation")
+    }
+
+    pub fn try_new(
+        slot_count: u32,
+        timeout_milliseconds: u64,
+    ) -> Result<Self, crate::types::Failure> {
         let count = slot_count as usize;
         // The baseline fills the stack so that the lowest free slot is handed out first.
-        let free_indices: Vec<u32> = (0..slot_count).rev().collect();
-        Self {
-            connections: (0..slot_count).map(Connection::new).collect(),
-            timers: TimerHeap::new(count),
+        let free_indices =
+            crate::types::try_vec_with(count, "TCP free list allocation", |index| {
+                slot_count - 1 - index as u32
+            })?;
+        Ok(Self {
+            connections: crate::types::try_vec_with(count, "TCP connection allocation", |index| {
+                Connection::new(index as u32)
+            })?,
+            timers: TimerHeap::try_new(count)?,
             free_indices,
             timeout_milliseconds,
             active_connections: 0,
@@ -70,7 +83,7 @@ impl TcpEngine {
             notification_armed: false,
             fatal: false,
             failure: None,
-        }
+        })
     }
 
     pub fn slot_count(&self) -> u32 {
@@ -267,7 +280,8 @@ impl TcpEngine {
     }
 
     /// Closes every connection whose deadline passed. Returns the releases that were
-    /// possible immediately; the rest arrive with their completions.
+    /// possible immediately; the rest arrive with their completions. Cold convenience API;
+    /// production uses `on_timeout_into` with preallocated worker storage.
     pub fn on_timeout(&mut self, now: u64, expired: &mut Vec<u32>) -> Vec<Step> {
         let mut steps = Vec::with_capacity(self.connections.len());
         self.on_timeout_into(now, expired, &mut steps);
@@ -302,7 +316,7 @@ impl TcpEngine {
     }
 
     /// Closes admission for this worker: no new socket is adopted and every live
-    /// connection starts closing.
+    /// connection starts closing. Cold convenience API; production uses `begin_stop_into`.
     pub fn begin_stop(&mut self) -> Vec<Step> {
         let mut steps = Vec::with_capacity(self.connections.len());
         self.begin_stop_into(0, &mut steps);

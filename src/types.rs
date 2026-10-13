@@ -24,8 +24,8 @@ pub enum ExitCode {
     Internal = 4,
 }
 
-#[derive(Clone, Debug)]
-pub struct ArgumentError(pub String);
+#[derive(Clone, Copy, Debug)]
+pub struct ArgumentError(pub &'static str);
 
 pub const DEFAULT_PORT: u16 = 7;
 pub const DEFAULT_TCP_TIMEOUT_SECONDS: u32 = 300;
@@ -56,6 +56,7 @@ pub const ADMISSION_CLOSED_KEY: usize = 2;
 /// Native status codes referenced by name. Values come from winerror.h and winsock2.h.
 pub const ERROR_SUCCESS: i32 = 0;
 pub const ERROR_NOT_ENOUGH_MEMORY: i32 = 8;
+pub const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 pub const ERROR_INVALID_DATA: i32 = 13;
 pub const ERROR_NETNAME_DELETED: u32 = 64;
 pub const ERROR_IO_PENDING: i32 = 997;
@@ -208,19 +209,40 @@ impl NotifySnapshot {
     }
 
     pub fn line(&self, protocol: Protocol) -> String {
+        self.display(protocol).to_string()
+    }
+
+    pub fn display(&self, protocol: Protocol) -> NotifyLine<'_> {
+        NotifyLine {
+            snapshot: self,
+            protocol,
+        }
+    }
+}
+
+pub struct NotifyLine<'a> {
+    snapshot: &'a NotifySnapshot,
+    protocol: Protocol,
+}
+
+impl core::fmt::Display for NotifyLine<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let snapshot = self.snapshot;
+        let protocol = self.protocol;
         let name = if protocol == Protocol::Udp {
             "udp"
         } else {
             "tcp"
         };
-        format!(
+        write!(
+            formatter,
             "role=server protocol={} worker={} notify_arms={} notify_deliveries={} notify_gap={} timeout_wakeups_while_outstanding={}\n",
             name,
-            self.worker,
-            self.arms,
-            self.deliveries,
-            self.arms.saturating_sub(self.deliveries),
-            self.timeout_wakeups
+            snapshot.worker,
+            snapshot.arms,
+            snapshot.deliveries,
+            snapshot.arms.saturating_sub(snapshot.deliveries),
+            snapshot.timeout_wakeups
         )
     }
 }
@@ -251,28 +273,61 @@ impl Statistics {
         worker_count: u32,
         outstanding: u32,
     ) -> String {
-        let guarded = elapsed_milliseconds.max(1);
-        let rate = self.bytes as f64 / (1024.0 * 1024.0) / (guarded as f64 / 1000.0);
-        let name = match protocol {
+        self.display(protocol, elapsed_milliseconds, worker_count, outstanding)
+            .to_string()
+    }
+
+    pub fn display(
+        &self,
+        protocol: Protocol,
+        elapsed_milliseconds: u64,
+        worker_count: u32,
+        outstanding: u32,
+    ) -> StatisticsLine<'_> {
+        StatisticsLine {
+            statistics: self,
+            protocol,
+            elapsed_milliseconds,
+            worker_count,
+            outstanding,
+        }
+    }
+}
+
+pub struct StatisticsLine<'a> {
+    statistics: &'a Statistics,
+    protocol: Protocol,
+    elapsed_milliseconds: u64,
+    worker_count: u32,
+    outstanding: u32,
+}
+
+impl core::fmt::Display for StatisticsLine<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let statistics = self.statistics;
+        let guarded = self.elapsed_milliseconds.max(1);
+        let rate = statistics.bytes as f64 / (1024.0 * 1024.0) / (guarded as f64 / 1000.0);
+        let name = match self.protocol {
             Protocol::Udp => "udp",
             _ => "tcp",
         };
-        format!(
+        write!(
+            formatter,
             "final protocol={} elapsed_ms={} workers={} accepted={} active=0 outstanding={} completions={} \
 receives={} sends={} received_bytes={} sent_bytes={} bytes={} network_errors={} rejected={} MiB_per_sec={:.2}",
             name,
-            elapsed_milliseconds,
-            worker_count,
-            self.accepted,
-            outstanding,
-            self.completions,
-            self.receives,
-            self.sends,
-            self.received_bytes,
-            self.sent_bytes,
-            self.bytes,
-            self.network_errors,
-            self.rejected,
+            self.elapsed_milliseconds,
+            self.worker_count,
+            statistics.accepted,
+            self.outstanding,
+            statistics.completions,
+            statistics.receives,
+            statistics.sends,
+            statistics.received_bytes,
+            statistics.sent_bytes,
+            statistics.bytes,
+            statistics.network_errors,
+            statistics.rejected,
             rate
         )
     }
@@ -424,6 +479,15 @@ pub struct Failure {
 }
 
 impl Failure {
+    pub const fn allocation(stage: &'static str) -> Self {
+        Self {
+            classification: FailureClass::Network,
+            domain: FailureDomain::Allocation,
+            stage,
+            code: ERROR_NOT_ENOUGH_MEMORY,
+        }
+    }
+
     pub const fn invariant(stage: &'static str) -> Self {
         Self {
             classification: FailureClass::Invariant,
@@ -440,6 +504,69 @@ impl Failure {
             code: 1460,
         }
     }
+}
+
+/// Reserve the whole production collection before any native operation or thread starts.
+pub fn try_vec_with_capacity<T>(count: usize, stage: &'static str) -> Result<Vec<T>, Failure> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| Failure::allocation(stage))?;
+    Ok(values)
+}
+
+pub fn try_vec_with<T>(
+    count: usize,
+    stage: &'static str,
+    mut make: impl FnMut(usize) -> T,
+) -> Result<Vec<T>, Failure> {
+    let mut values = try_vec_with_capacity(count, stage)?;
+    for index in 0..count {
+        values.push(make(index));
+    }
+    Ok(values)
+}
+
+pub fn try_box<T>(value: T, stage: &'static str) -> Result<Box<T>, Failure> {
+    Box::try_new(value).map_err(|_| Failure::allocation(stage))
+}
+
+pub fn try_arc<T>(value: T, stage: &'static str) -> Result<std::sync::Arc<T>, Failure> {
+    std::sync::Arc::try_new(value).map_err(|_| Failure::allocation(stage))
+}
+
+/// Allocate the final stable slice directly; no infallible shrinking or conversion follows.
+pub fn try_boxed_slice_with<T>(
+    count: usize,
+    stage: &'static str,
+    mut make: impl FnMut(usize) -> T,
+) -> Result<Box<[T]>, Failure> {
+    struct Initializing<T> {
+        values: Option<Box<[core::mem::MaybeUninit<T>]>>,
+        initialized: usize,
+    }
+    impl<T> Drop for Initializing<T> {
+        fn drop(&mut self) {
+            if let Some(values) = &mut self.values {
+                for value in &mut values[..self.initialized] {
+                    // SAFETY: initialized counts only entries whose write completed.
+                    unsafe { value.assume_init_drop() };
+                }
+            }
+        }
+    }
+    let values = Box::<[T]>::try_new_uninit_slice(count).map_err(|_| Failure::allocation(stage))?;
+    let mut owner = Initializing {
+        values: Some(values),
+        initialized: 0,
+    };
+    for index in 0..count {
+        owner.values.as_mut().unwrap()[index].write(make(index));
+        owner.initialized += 1;
+    }
+    let values = owner.values.take().unwrap();
+    // SAFETY: every entry was initialized above; the guard no longer owns the slice.
+    Ok(unsafe { values.assume_init() })
 }
 
 /// Native completion metadata after the transport has retired its provider-owned request.
@@ -466,4 +593,56 @@ pub struct UdpLifecycle {
     pub outstanding: u32,
     pub closing: bool,
     pub failed: bool,
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn impossible_extents_report_allocation_failure_before_initialization() {
+        let expected = Failure::allocation("allocation probe");
+        assert_eq!(
+            try_vec_with_capacity::<u16>(usize::MAX, "allocation probe").unwrap_err(),
+            expected,
+        );
+        let initialized = Cell::new(false);
+        let result = try_boxed_slice_with(usize::MAX, "allocation probe", |_| {
+            initialized.set(true);
+            0u16
+        });
+        assert_eq!(result.unwrap_err(), expected);
+        assert!(!initialized.get());
+    }
+
+    #[test]
+    fn stable_slice_initialization_preserves_and_releases_every_owner() {
+        struct Owner<'a>(&'a Cell<usize>, usize);
+        impl Drop for Owner<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Cell::new(0);
+        let values = try_boxed_slice_with(3, "allocation probe", |index| Owner(&drops, index))
+            .ok()
+            .unwrap();
+        assert_eq!(values[2].1, 2);
+        assert_eq!(drops.get(), 0);
+        drop(values);
+        assert_eq!(drops.get(), 3);
+
+        // A constructor panic must retire initialized owners while ignoring uninitialized tail.
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = try_boxed_slice_with(3, "allocation probe", |index| {
+                if index == 2 {
+                    panic!("initialization probe");
+                }
+                Owner(&drops, index)
+            });
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(drops.get(), 5);
+    }
 }

@@ -36,8 +36,17 @@ pub const USAGE: &[&str] = &[
 ];
 
 /// The usage text as the process prints it.
-pub fn help_text() -> String {
-    USAGE.join("\n")
+pub fn help_text() -> &'static str {
+    concat!(
+        "Usage: rust-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds] [/b bytes]\n",
+        "       [/k depth] [/threads workers] [/rio-buffer bytes]\n",
+        "       [/cq capacity] [/memory bytes] [/q] [/stats] [/h]\n",
+        "/t seconds: TCP idle timeout; UDP rejects /t.\n",
+        "/k depth: UDP receive slots; TCP rejects /k.\n",
+        "/threads 0: automatic TCP workers, min(active processors, 64); UDP uses 1.\n",
+        "/w 0: no run limit. /memory bounds page-rounded registered arenas.\n",
+        "/q suppresses nonessential output; /stats prints final; /h shows help."
+    )
 }
 
 use crate::types::{ArgumentError, MAXIMUM_UDP_PAYLOAD_BYTES, Options, Protocol};
@@ -157,84 +166,144 @@ pub fn advance_offset_u32(total: u32, transferred: u32, offset: &mut u32) -> boo
     true
 }
 
-fn switch_offset(token: &str) -> Option<usize> {
-    let bytes = token.as_bytes();
-    if bytes.len() < 2 || (bytes[0] != b'/' && bytes[0] != b'-') {
+/// Borrowed parser input. UTF-8 adapters need no conversion because all accepted
+/// switches and values are ASCII; the production path borrows the CRT's UTF-16.
+#[derive(Clone, Copy)]
+enum Text<'a> {
+    Utf8(&'a str),
+    Wide(&'a [u16]),
+}
+
+impl Text<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Utf8(text) => text.len(),
+            Self::Wide(text) => text.len(),
+        }
+    }
+
+    fn unit(self, index: usize) -> u16 {
+        match self {
+            Self::Utf8(text) => u16::from(text.as_bytes()[index]),
+            Self::Wide(text) => text[index],
+        }
+    }
+
+    fn slice(self, start: usize, end: usize) -> Self {
+        match self {
+            Self::Utf8(text) => Self::Utf8(&text[start..end]),
+            Self::Wide(text) => Self::Wide(&text[start..end]),
+        }
+    }
+
+    fn eq_ascii(self, expected: &str) -> bool {
+        self.len() == expected.len()
+            && expected.bytes().enumerate().all(|(index, expected)| {
+                let unit = self.unit(index);
+                let lower = if (65..=90).contains(&unit) {
+                    unit + 32
+                } else {
+                    unit
+                };
+                lower == u16::from(expected)
+            })
+    }
+
+    fn valid_utf16(self) -> bool {
+        let Self::Wide(text) = self else {
+            return true;
+        };
+        let mut index = 0;
+        while index < text.len() {
+            let unit = text[index];
+            index += 1;
+            if (0xd800..=0xdbff).contains(&unit) {
+                if index == text.len() || !(0xdc00..=0xdfff).contains(&text[index]) {
+                    return false;
+                }
+                index += 1;
+            } else if (0xdc00..=0xdfff).contains(&unit) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn switch_offset(token: Text<'_>) -> Option<usize> {
+    if token.len() < 2 || !matches!(token.unit(0), 45 | 47) {
         return None;
     }
-    let offset = if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] == b'-' {
+    let offset = if token.len() > 2 && token.unit(0) == 45 && token.unit(1) == 45 {
         2
     } else {
         1
     };
-    let first = bytes[offset].to_ascii_lowercase();
-    if first.is_ascii_lowercase() {
+    if matches!(token.unit(offset), 65..=90 | 97..=122) {
         Some(offset)
     } else {
         None
     }
 }
 
-fn numeric(value: &str) -> Result<u64, ArgumentError> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ArgumentError(token::INVALID_NUMBER.to_string()));
+fn numeric(value: Text<'_>) -> Result<u64, ArgumentError> {
+    if value.len() == 0 {
+        return Err(ArgumentError(token::INVALID_NUMBER));
     }
-    value
-        .parse::<u64>()
-        .map_err(|_| ArgumentError(crate::contract::token::INVALID_NUMBER.to_string()))
+    let mut number = 0u64;
+    for index in 0..value.len() {
+        let unit = value.unit(index);
+        if !(48..=57).contains(&unit) {
+            return Err(ArgumentError(token::INVALID_NUMBER));
+        }
+        let digit = u64::from(unit - 48);
+        if number > (u64::MAX - digit) / 10 {
+            return Err(ArgumentError(token::INVALID_NUMBER));
+        }
+        number = number * 10 + digit;
+    }
+    Ok(number)
 }
 
 /// Strict parser: unknown switches, empty values, positional arguments and
 /// out-of-range numbers are usage errors, and /h never masks a malformed command line.
 pub fn parse(arguments: &[String]) -> Result<Options, ArgumentError> {
-    let decoded: Vec<Argument> = arguments
-        .iter()
-        .map(|value| Argument {
-            text: Ok(value.clone()),
-            is_switch: switch_offset(value).is_some(),
-            empty: value.is_empty(),
-        })
-        .collect();
-    parse_arguments(&decoded)
-}
-
-struct Argument {
-    text: Result<String, ArgumentError>,
-    is_switch: bool,
-    empty: bool,
+    parse_arguments(arguments.len(), |index| {
+        let text = &arguments[index];
+        let length = text
+            .as_bytes()
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(text.len());
+        Text::Utf8(&text[..length])
+    })
 }
 
 /// Keeps UTF-16 validation in the same order as the wide-argv parser, including the
 /// missing-value check that precedes validation of a following switch-shaped token.
 pub fn parse_wide(arguments: &[Vec<u16>]) -> Result<Options, ArgumentError> {
-    let decoded: Vec<Argument> = arguments
-        .iter()
-        .map(|value| {
-            let offset =
-                if value.len() > 2 && value[0] == u16::from(b'-') && value[1] == u16::from(b'-') {
-                    2
-                } else {
-                    1
-                };
-            let is_switch = value.len() >= 2
-                && matches!(value[0], 45 | 47)
-                && value
-                    .get(offset)
-                    .is_some_and(|first| matches!(*first, 65..=90 | 97..=122));
-            Argument {
-                text: String::from_utf16(value)
-                    .map_err(|_| ArgumentError(token::INVALID_UTF16.to_string())),
-                is_switch,
-                empty: value.is_empty(),
-            }
-        })
-        .collect();
-    parse_arguments(&decoded)
+    parse_arguments(arguments.len(), |index| {
+        let text = &arguments[index];
+        let length = text
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(text.len());
+        Text::Wide(&text[..length])
+    })
 }
 
-fn parse_arguments(arguments: &[Argument]) -> Result<Options, ArgumentError> {
-    if arguments.is_empty() {
-        return Err(ArgumentError("invalid parser arguments".to_string()));
+pub fn parse_native(arguments: &crate::native::WideArguments) -> Result<Options, ArgumentError> {
+    parse_arguments(arguments.len(), |index| {
+        Text::Wide(arguments.argument(index))
+    })
+}
+
+fn parse_arguments<'a>(
+    count: usize,
+    argument: impl Fn(usize) -> Text<'a>,
+) -> Result<Options, ArgumentError> {
+    if count == 0 {
+        return Err(ArgumentError("invalid parser arguments"));
     }
     let mut options = Options::default();
     let mut saw_timeout = false;
@@ -242,66 +311,85 @@ fn parse_arguments(arguments: &[Argument]) -> Result<Options, ArgumentError> {
     let mut saw_rio_buffer = false;
     let mut saw_workers = false;
     let mut index = 1;
-    while index < arguments.len() {
-        let token = arguments[index].text.as_ref().map_err(Clone::clone)?;
+    while index < count {
+        let token = argument(index);
+        if !token.valid_utf16() {
+            return Err(ArgumentError(token::INVALID_UTF16));
+        }
         index += 1;
         let Some(offset) = switch_offset(token) else {
-            return Err(ArgumentError(token::UNEXPECTED_TARGET.to_string()));
+            return Err(ArgumentError(token::UNEXPECTED_TARGET));
         };
-        let rest = &token[offset..];
-        let (name, inline) = match rest.split_once('=') {
-            Some((name, value)) => (name.to_ascii_lowercase(), Some(value.to_string())),
-            None => (rest.to_ascii_lowercase(), None),
-        };
-        if matches!(name.as_str(), "q" | "quiet" | "stats" | "h" | "help") {
+        let rest = token.slice(offset, token.len());
+        let separator = (0..rest.len()).find(|&index| rest.unit(index) == 61);
+        let name = rest.slice(0, separator.unwrap_or(rest.len()));
+        let inline = separator.map(|position| rest.slice(position + 1, rest.len()));
+        if ["q", "quiet", "stats", "h", "help"]
+            .iter()
+            .any(|&flag| name.eq_ascii(flag))
+        {
             if inline.is_some() {
                 // A flag never takes a value, and an empty one is still a value.
-                return Err(ArgumentError(token::UNEXPECTED_VALUE.to_string()));
+                return Err(ArgumentError(token::UNEXPECTED_VALUE));
             }
-            match name.as_str() {
-                "q" | "quiet" => options.quiet = true,
-                "stats" => options.stats = true,
-                _ => options.help = true,
+            if name.eq_ascii("q") || name.eq_ascii("quiet") {
+                options.quiet = true;
+            } else if name.eq_ascii("stats") {
+                options.stats = true;
+            } else {
+                options.help = true;
             }
             continue;
         }
-        if !matches!(
-            name.as_str(),
-            "p" | "s" | "t" | "w" | "b" | "k" | "threads" | "rio-buffer" | "cq" | "memory"
-        ) {
-            return Err(ArgumentError(
-                crate::contract::token::UNKNOWN_SWITCH.to_string(),
-            ));
-        }
+        let Some(option) = [
+            "p",
+            "s",
+            "t",
+            "w",
+            "b",
+            "k",
+            "threads",
+            "rio-buffer",
+            "cq",
+            "memory",
+        ]
+        .iter()
+        .copied()
+        .find(|&known| name.eq_ascii(known)) else {
+            return Err(ArgumentError(token::UNKNOWN_SWITCH));
+        };
         let value = match inline {
-            Some(value) if !value.is_empty() => value,
-            Some(_) => return Err(ArgumentError(token::MISSING_VALUE.to_string())),
+            Some(value) if value.len() != 0 => value,
+            Some(_) => return Err(ArgumentError(token::MISSING_VALUE)),
             None => {
-                if index >= arguments.len() || arguments[index].empty || arguments[index].is_switch
-                {
-                    return Err(ArgumentError(token::MISSING_VALUE.to_string()));
+                if index >= count {
+                    return Err(ArgumentError(token::MISSING_VALUE));
                 }
-                let value = arguments[index]
-                    .text
-                    .as_ref()
-                    .map_err(Clone::clone)?
-                    .clone();
+                let value = argument(index);
+                if value.len() == 0 || switch_offset(value).is_some() {
+                    return Err(ArgumentError(token::MISSING_VALUE));
+                }
                 index += 1;
                 value
             }
         };
-        if name == "p" {
+        if !value.valid_utf16() {
+            return Err(ArgumentError(token::INVALID_UTF16));
+        }
+        if option == "p" {
             // The reference matches the protocol keyword itself and reports the parse failure as
             // an out-of-range value, not as a protocol-specific message.
-            options.protocol = match value.to_ascii_lowercase().as_str() {
-                "tcp" => Protocol::Tcp,
-                "udp" => Protocol::Udp,
-                _ => return Err(ArgumentError(token::OUT_OF_RANGE.to_string())),
+            options.protocol = if value.eq_ascii("tcp") {
+                Protocol::Tcp
+            } else if value.eq_ascii("udp") {
+                Protocol::Udp
+            } else {
+                return Err(ArgumentError(token::OUT_OF_RANGE));
             };
             continue;
         }
-        let number = numeric(&value)?;
-        let range = match name.as_str() {
+        let number = numeric(value)?;
+        let range = match option {
             "s" => 1..=65_535,
             "t" => 1..=u64::from(u32::MAX),
             "w" => 0..=u64::from(u32::MAX),
@@ -313,11 +401,9 @@ fn parse_arguments(arguments: &[Argument]) -> Result<Options, ArgumentError> {
             _ => 1_048_576..=u64::MAX,
         };
         if !range.contains(&number) {
-            return Err(ArgumentError(
-                crate::contract::token::OUT_OF_RANGE.to_string(),
-            ));
+            return Err(ArgumentError(token::OUT_OF_RANGE));
         }
-        match name.as_str() {
+        match option {
             "s" => options.port = number as u16,
             "t" => {
                 options.timeout_seconds = number as u32;
@@ -342,17 +428,13 @@ fn parse_arguments(arguments: &[Argument]) -> Result<Options, ArgumentError> {
         }
     }
     if options.protocol == Protocol::Tcp && saw_udp_depth {
-        return Err(ArgumentError(
-            crate::contract::token::PROTOCOL_OPTION.to_string(),
-        ));
+        return Err(ArgumentError(token::PROTOCOL_OPTION));
     }
     if options.protocol == Protocol::Udp && (saw_timeout) {
-        return Err(ArgumentError(
-            crate::contract::token::PROTOCOL_OPTION.to_string(),
-        ));
+        return Err(ArgumentError(token::PROTOCOL_OPTION));
     }
     if options.protocol == Protocol::Udp && saw_workers && options.worker_count > 1 {
-        return Err(ArgumentError(token::PROTOCOL_OPTION.to_string()));
+        return Err(ArgumentError(token::PROTOCOL_OPTION));
     }
     // Option validation precedes the help short-circuit, exactly like the reference: /h never
     // masks a malformed command line.
@@ -366,11 +448,11 @@ fn parse_arguments(arguments: &[Argument]) -> Result<Options, ArgumentError> {
             // own default.
             options.rio_buffer_bytes = MAXIMUM_UDP_PAYLOAD_BYTES as u32;
         } else if u64::from(options.rio_buffer_bytes) < MAXIMUM_UDP_PAYLOAD_BYTES {
-            return Err(ArgumentError(token::PAYLOAD_SIZE.to_string()));
+            return Err(ArgumentError(token::PAYLOAD_SIZE));
         }
         // Each datagram slot reserves a queue entry per direction.
         if options.udp_depth > options.cq_capacity / 2 {
-            return Err(ArgumentError(token::CQ_CAPACITY.to_string()));
+            return Err(ArgumentError(token::CQ_CAPACITY));
         }
         let stride = u64::from(options.rio_buffer_bytes) + UDP_ADDRESS_BYTES;
         match checked_page_rounded_arena_bytes(
@@ -380,7 +462,7 @@ fn parse_arguments(arguments: &[Argument]) -> Result<Options, ArgumentError> {
             crate::native::page_bytes(),
         ) {
             Some(bytes) if bytes <= u64::from(u32::MAX) => {}
-            _ => return Err(ArgumentError(token::MEMORY_CAPACITY.to_string())),
+            _ => return Err(ArgumentError(token::MEMORY_CAPACITY)),
         }
     }
     if options.protocol == Protocol::Tcp {
@@ -400,7 +482,7 @@ fn parse_arguments(arguments: &[Argument]) -> Result<Options, ArgumentError> {
             let slots = (u64::from(options.cq_capacity) / 2)
                 .min(budget / u64::from(options.rio_buffer_bytes));
             if slots == 0 {
-                return Err(ArgumentError(token::MEMORY_CAPACITY.to_string()));
+                return Err(ArgumentError(token::MEMORY_CAPACITY));
             }
         }
     }
@@ -408,7 +490,7 @@ fn parse_arguments(arguments: &[Argument]) -> Result<Options, ArgumentError> {
         return Ok(options);
     }
     if options.protocol == Protocol::None {
-        return Err(ArgumentError(token::MISSING_PROTOCOL.to_string()));
+        return Err(ArgumentError(token::MISSING_PROTOCOL));
     }
     Ok(options)
 }

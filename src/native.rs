@@ -37,6 +37,78 @@ pub struct NativeError {
     pub code: i32,
 }
 
+// Use the same unexpanded UCRT argv parser as the C++ wmain entry point. The
+// CRT owns this storage for the process lifetime; no Rust argument copies exist.
+#[link(name = "ucrt")]
+unsafe extern "C" {
+    fn _configure_wide_argv(mode: i32) -> i32;
+    fn __p___argc() -> *mut i32;
+    fn __p___wargv() -> *mut *mut *mut u16;
+}
+
+#[derive(Clone, Copy)]
+pub struct WideArguments {
+    count: usize,
+    argv: usize,
+}
+
+impl WideArguments {
+    pub fn current() -> Result<Self, NativeError> {
+        static ARGUMENTS: std::sync::OnceLock<Result<WideArguments, NativeError>> =
+            std::sync::OnceLock::new();
+        *ARGUMENTS.get_or_init(Self::initialize)
+    }
+
+    fn initialize() -> Result<Self, NativeError> {
+        // SAFETY: OnceLock initializes the wide argv table exactly once, including
+        // concurrent calls. Afterwards this module only reads the process-owned data.
+        // Unexpanded mode is the baseline CRT default and preserves its quoting rules.
+        unsafe {
+            let mut argv = *__p___wargv();
+            if argv.is_null() {
+                let status = _configure_wide_argv(1);
+                if status != 0 {
+                    return Err(NativeError::code(
+                        "command line allocation",
+                        crate::types::ERROR_NOT_ENOUGH_MEMORY,
+                    ));
+                }
+                argv = *__p___wargv();
+            }
+            let count = *__p___argc();
+            if count < 1 || argv.is_null() {
+                return Err(NativeError::code(
+                    "command line arguments",
+                    crate::types::ERROR_INVALID_DATA,
+                ));
+            }
+            Ok(Self {
+                count: count as usize,
+                argv: argv as usize,
+            })
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn argument(&self, index: usize) -> &[u16] {
+        assert!(index < self.count);
+        // SAFETY: the checked CRT table contains count NUL-terminated UTF-16
+        // arguments; this module never reconfigures it while a view exists.
+        unsafe {
+            let argv = self.argv as *const *const u16;
+            let text = *argv.add(index);
+            let mut length = 0;
+            while *text.add(length) != 0 {
+                length += 1;
+            }
+            core::slice::from_raw_parts(text, length)
+        }
+    }
+}
+
 impl NativeError {
     /// Captures the thread's last-error value at the failing call site; the value is never
     /// read back later, when another Win32 call would have overwritten it.
@@ -56,6 +128,12 @@ impl NativeError {
 
     pub fn code(stage: &'static str, code: i32) -> Self {
         Self { stage, code }
+    }
+}
+
+impl From<crate::types::Failure> for NativeError {
+    fn from(failure: crate::types::Failure) -> Self {
+        Self::code(failure.stage, failure.code)
     }
 }
 
@@ -163,6 +241,212 @@ impl Drop for HandleOwner {
         self.reset(ptr::null_mut());
     }
 }
+
+/// Raw ownership survives publication to RIO without moving or retagging a Box.
+/// The notification address outlives both its completion queue and its IOCP.
+pub(crate) struct NotificationStorage {
+    pointer: core::ptr::NonNull<windows::Win32::minwinbase::OVERLAPPED>,
+    bound: bool,
+}
+
+impl NotificationStorage {
+    pub(crate) fn create(stage: &'static str) -> Result<Self, crate::types::Failure> {
+        let value =
+            crate::types::try_box(windows::Win32::minwinbase::OVERLAPPED::default(), stage)?;
+        let pointer = core::ptr::NonNull::new(Box::into_raw(value)).unwrap_or_else(|| {
+            fail_fast("notification allocation", crate::types::ERROR_INVALID_DATA)
+        });
+        Ok(Self {
+            pointer,
+            bound: false,
+        })
+    }
+
+    pub(crate) fn raw(&self) -> *mut windows::Win32::minwinbase::OVERLAPPED {
+        self.pointer.as_ptr()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        // Callers clear only before a new arm, after the previous notification delivery.
+        // Keep raw ownership: constructing a mutable Box reference would retag the storage.
+        unsafe {
+            self.pointer
+                .as_ptr()
+                .write(windows::Win32::minwinbase::OVERLAPPED::default());
+        }
+    }
+
+    pub(crate) fn bind(&mut self) {
+        if self.bound {
+            fail_fast(
+                "notification double binding",
+                crate::types::ERROR_INVALID_DATA,
+            );
+        }
+        self.bound = true;
+    }
+
+    pub(crate) fn release_binding(
+        &mut self,
+        queue: &rio::CompletionQueue,
+        port: &rio::CompletionPort,
+    ) {
+        if !queue.raw().is_null() || !port.raw().is_null() {
+            fail_fast(
+                "notification release before CQ/IOCP close",
+                crate::types::ERROR_IO_INCOMPLETE,
+            );
+        }
+        self.bound = false;
+    }
+}
+
+impl Drop for NotificationStorage {
+    fn drop(&mut self) {
+        if self.bound {
+            fail_fast(
+                "notification release while CQ bound",
+                crate::types::ERROR_IO_INCOMPLETE,
+            );
+        }
+        // SAFETY: creation transferred Box ownership, and no bound queue or port remains.
+        unsafe {
+            drop(Box::from_raw(self.pointer.as_ptr()));
+        }
+    }
+}
+
+struct ThreadState<T> {
+    value: core::cell::UnsafeCell<Option<T>>,
+    run: fn(&mut T),
+    finished: core::sync::atomic::AtomicBool,
+}
+
+/// Native thread ownership with one checked allocation, replacing std::thread's
+/// infallible Arc/Box initialization. The value is coordinator-owned throughout;
+/// only the started thread mutates it until Join establishes the release barrier.
+pub struct NativeThread<T> {
+    handle: HandleOwner,
+    state: Option<core::ptr::NonNull<ThreadState<T>>>,
+    join_stage: &'static str,
+}
+
+impl<T: Send + 'static> NativeThread<T> {
+    pub fn spawn(value: T, run: fn(&mut T), stage: &'static str) -> Result<Self, NativeError> {
+        let state = crate::types::try_box(
+            ThreadState {
+                value: core::cell::UnsafeCell::new(Some(value)),
+                run,
+                finished: core::sync::atomic::AtomicBool::new(false),
+            },
+            stage,
+        )
+        .map_err(NativeError::from)?;
+        // Transfer the Box into raw ownership before deriving the callback pointer.
+        // Moving a live Box after pointer derivation can invalidate its provenance.
+        let state = core::ptr::NonNull::new(Box::into_raw(state)).unwrap();
+        let parameter = state.as_ptr().cast::<c_void>();
+        // SAFETY: raw ownership prevents Box retagging while the callback borrows
+        // the packet. On success storage survives until Join; failure starts no callback.
+        let handle = unsafe {
+            windows::Win32::processthreadsapi::CreateThread(
+                None,
+                0,
+                Some(native_thread_entry::<T>),
+                Some(parameter),
+                0,
+                None,
+            )
+        };
+        if handle.is_null() {
+            let error = NativeError::last(stage);
+            // SAFETY: failed CreateThread never started a callback, so ownership
+            // immediately returns to the coordinator for initialization rollback.
+            unsafe {
+                drop(Box::from_raw(state.as_ptr()));
+            }
+            return Err(error);
+        }
+        let join_stage = match stage {
+            "CreateThread(worker)" => "WaitForSingleObject(server worker)",
+            "CreateThread(acceptor)" => "WaitForSingleObject(acceptor)",
+            _ => "WaitForSingleObject(thread join)",
+        };
+        Ok(Self {
+            handle: HandleOwner::new(handle),
+            state: Some(state),
+            join_stage,
+        })
+    }
+
+    pub fn join(&mut self) -> T {
+        let status = unsafe {
+            windows::Win32::synchapi::WaitForSingleObject(self.handle.raw(), crate::types::INFINITE)
+        };
+        if status != crate::types::WAIT_OBJECT_0 {
+            let error = NativeError::last(self.join_stage);
+            fail_fast(error.stage, error.code);
+        }
+        let Some(state) = self.state.take() else {
+            fail_fast("native thread join state", crate::types::ERROR_INVALID_DATA);
+        };
+        if !unsafe { state.as_ref() }
+            .finished
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            fail_fast(
+                "native thread result publication",
+                crate::types::ERROR_INVALID_DATA,
+            );
+        }
+        // SAFETY: native Join completed and publication was acquired. No callback
+        // reference remains, so the coordinator may restore exclusive Box ownership.
+        let state = unsafe { Box::from_raw(state.as_ptr()) };
+        let ThreadState { value, .. } = *state;
+        value.into_inner().unwrap_or_else(|| {
+            fail_fast(
+                "native thread result ownership",
+                crate::types::ERROR_INVALID_DATA,
+            )
+        })
+    }
+}
+
+impl<T> Drop for NativeThread<T> {
+    fn drop(&mut self) {
+        // A missed Join must never free memory still borrowed by the callback.
+        if self.state.is_some() {
+            fail_fast(
+                "native thread release before join",
+                crate::types::ERROR_IO_INCOMPLETE,
+            );
+        }
+    }
+}
+
+unsafe extern "system" fn native_thread_entry<T: Send + 'static>(parameter: *mut c_void) -> u32 {
+    // SAFETY: CreateThread receives exactly the live ThreadState<T> packet.
+    // This thread exclusively accesses value until the coordinator waits for exit.
+    let state = unsafe { &*parameter.cast::<ThreadState<T>>() };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let value = unsafe { &mut *state.value.get() };
+        let Some(value) = value.as_mut() else {
+            fail_fast(
+                "native thread entry ownership",
+                crate::types::ERROR_INVALID_DATA,
+            );
+        };
+        (state.run)(value);
+    }));
+    if result.is_err() {
+        // Never unwind across the Windows ABI or release unaccounted native I/O.
+        fail_fast("native thread panic", crate::types::ERROR_INVALID_DATA);
+    }
+    state
+        .finished
+        .store(true, core::sync::atomic::Ordering::Release);
+    0
+}
 /// Creates a socket that is both overlapped and registered with RIO. Registration is a
 /// hard requirement: RIO refuses to associate an unregistered socket with a queue.
 pub fn registered_socket(protocol: Protocol) -> Result<SocketOwner, NativeError> {
@@ -192,10 +476,7 @@ pub fn registered_socket(protocol: Protocol) -> Result<SocketOwner, NativeError>
 pub fn configure_socket(socket: SOCKET, tcp: bool, buffer_bytes: u32) -> Result<(), NativeError> {
     if buffer_bytes != 0 {
         let value = buffer_bytes as i32;
-        for (stage, option) in [
-            ("setsockopt(SO_SNDBUF)", SO_SNDBUF),
-            ("setsockopt(SO_RCVBUF)", SO_RCVBUF),
-        ] {
+        for option in [SO_SNDBUF, SO_RCVBUF] {
             let status = unsafe {
                 setsockopt(
                     socket,
@@ -206,7 +487,7 @@ pub fn configure_socket(socket: SOCKET, tcp: bool, buffer_bytes: u32) -> Result<
                 )
             };
             if status != 0 {
-                return Err(NativeError::winsock(stage));
+                return Err(NativeError::winsock("setsockopt(SO_SNDBUF/SO_RCVBUF)"));
             }
         }
     }
@@ -267,7 +548,7 @@ impl RioFunctions {
         };
         if status != 0 {
             return Err(NativeError::winsock(
-                "WSAIoctl(SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER)",
+                "SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER(RIO)",
             ));
         }
         if returned != expected || table.cbSize != expected {
@@ -315,7 +596,98 @@ unsafe impl Sync for SendHandle {}
 /// Reports a native failure exactly like the baseline: stage plus the error value of the
 /// API that failed.
 pub fn report(stage: &str, code: i32) {
-    eprintln!("{} failed: native_error={}", stage, code);
+    write_stderr(format_args!("{} failed: native_error={}\n", stage, code));
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(kind: u32) -> HANDLE;
+    fn WriteFile(
+        handle: HANDLE,
+        buffer: *const c_void,
+        bytes: u32,
+        written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn GetEnvironmentVariableW(name: *const u16, buffer: *mut u16, size: u32) -> u32;
+    fn CreateFileW(
+        name: *const u16,
+        access: u32,
+        share: u32,
+        security: *const c_void,
+        creation: u32,
+        flags: u32,
+        template: HANDLE,
+    ) -> HANDLE;
+}
+
+struct OutputBuffer<const N: usize> {
+    bytes: [u8; N],
+    length: usize,
+}
+
+impl<const N: usize> OutputBuffer<N> {
+    fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            length: 0,
+        }
+    }
+}
+
+impl<const N: usize> core::fmt::Write for OutputBuffer<N> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        if text.len() > N - self.length {
+            return Err(core::fmt::Error);
+        }
+        self.bytes[self.length..self.length + text.len()].copy_from_slice(text.as_bytes());
+        self.length += text.len();
+        Ok(())
+    }
+}
+
+fn write_all_native(handle: HANDLE, bytes: &[u8]) {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let remaining = (bytes.len() - offset).min(u32::MAX as usize) as u32;
+        let mut written = 0;
+        let succeeded = unsafe {
+            WriteFile(
+                handle,
+                bytes.as_ptr().add(offset).cast(),
+                remaining,
+                &mut written,
+                ptr::null_mut(),
+            )
+        };
+        if succeeded == 0 || written == 0 || written > remaining {
+            break;
+        }
+        offset += written as usize;
+    }
+}
+
+fn write_output(kind: u32, arguments: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    // Every production line and the complete help text fit this stack buffer.
+    // No stdio initialization, allocator, or write-error panic changes the exit code.
+    let mut buffer = OutputBuffer::<2048>::new();
+    if buffer.write_fmt(arguments).is_err() {
+        return;
+    }
+    static OUTPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = OUTPUT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let handle = unsafe { GetStdHandle(kind) };
+    write_all_native(handle, &buffer.bytes[..buffer.length]);
+}
+
+pub fn write_stdout(arguments: core::fmt::Arguments<'_>) {
+    write_output(-11i32 as u32, arguments);
+}
+pub fn write_stderr(arguments: core::fmt::Arguments<'_>) {
+    write_output(-12i32 as u32, arguments);
 }
 
 /// Internal invariant damage terminates deterministically with the internal exit code; no
@@ -358,26 +730,53 @@ pub fn page_bytes() -> u64 {
 /// Diagnostics are opt-in and never affect the run's exit code or standard streams.
 /// Callers pass snapshots only after all owning loops have stopped and joined.
 pub fn write_diagnostics(values: &[crate::types::NotifySnapshot], protocol: Protocol) {
-    use std::io::Write;
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::OpenOptionsExt;
-    let Some(path) = std::env::var_os("CES_DIAG_FILE") else {
-        return;
-    };
-    if path.is_empty() || path.encode_wide().count() >= 512 {
+    use core::fmt::Write;
+    const NAME: &[u16] = &[67, 69, 83, 95, 68, 73, 65, 71, 95, 70, 73, 76, 69, 0];
+    let required = unsafe { GetEnvironmentVariableW(NAME.as_ptr(), ptr::null_mut(), 0) };
+    let mut path = [0u16; 512];
+    if required == 0 || required > path.len() as u32 {
         return;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .share_mode(1)
-        .open(path)
-    else {
+    let copied =
+        unsafe { GetEnvironmentVariableW(NAME.as_ptr(), path.as_mut_ptr(), path.len() as u32) };
+    if copied == 0 || copied >= path.len() as u32 {
         return;
-    };
+    }
+    let file = HandleOwner::new(unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            0x4000_0000,
+            1,
+            ptr::null(),
+            2,
+            0x80,
+            ptr::null_mut(),
+        )
+    });
+    if !file.is_open() {
+        return;
+    }
     for snapshot in values {
-        if file.write_all(snapshot.line(protocol).as_bytes()).is_err() {
+        // _snprintf_s in the baseline skips a line that would exceed 191 bytes.
+        let mut buffer = OutputBuffer::<191>::new();
+        if buffer
+            .write_fmt(format_args!("{}", snapshot.display(protocol)))
+            .is_err()
+        {
+            continue;
+        }
+        let mut written = 0;
+        if unsafe {
+            WriteFile(
+                file.raw(),
+                buffer.bytes.as_ptr().cast(),
+                buffer.length as u32,
+                &mut written,
+                ptr::null_mut(),
+            )
+        } == 0
+            || written != buffer.length as u32
+        {
             break;
         }
     }
@@ -402,7 +801,9 @@ pub fn load_accept_ex(listener: SOCKET) -> Result<LPFN_ACCEPTEX, NativeError> {
         )
     };
     if status != 0 {
-        return Err(NativeError::winsock("WSAIoctl(WSAID_ACCEPTEX)"));
+        return Err(NativeError::winsock(
+            "SIO_GET_EXTENSION_FUNCTION_POINTER(AcceptEx)",
+        ));
     }
     if function.is_none() || returned != size_of::<LPFN_ACCEPTEX>() as u32 {
         return Err(NativeError {
@@ -522,7 +923,10 @@ pub mod arena {
                     code: 13,
                 });
             }
-            let registered = Vec::with_capacity(bytes / stride as usize);
+            let registered = crate::types::try_vec_with_capacity(
+                bytes / stride as usize,
+                "arena registration allocation",
+            )?;
             let base =
                 unsafe { VirtualAlloc(None, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }
                     as *mut u8;

@@ -2,11 +2,10 @@ use std::process::ExitCode as ProcessExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use ces::contract::parse_wide;
-use ces::native::{NativeError, report};
+use ces::contract::parse_native;
+use ces::native::{NativeError, WideArguments, report, write_stderr, write_stdout};
 use ces::server::run_server;
 use ces::types::{ExitCode, Options, Protocol};
-use std::os::windows::ffi::OsStrExt;
 
 /// The console handler observes this flag; the engine polls it while draining, so a
 /// saturated server still stops promptly.
@@ -29,20 +28,27 @@ unsafe extern "system" fn console_handler(event: u32) -> windows::core::BOOL {
 }
 
 fn help() {
-    println!("{}", ces::contract::help_text());
+    write_stdout(format_args!("{}\n", ces::contract::help_text()));
 }
 
 /// A malformed command line reports the diagnostic and the usage on stderr, exactly like the
 /// reference: stdout stays empty so a caller can tell a usage error from a successful /h.
 fn help_error() {
-    eprintln!("{}", ces::contract::help_text());
+    write_stderr(format_args!("{}\n", ces::contract::help_text()));
 }
 
 fn run(options: &Options) -> ExitCode {
     match options.protocol {
         Protocol::None => ExitCode::Usage,
         Protocol::Tcp | Protocol::Udp => {
-            let control = Arc::new(AtomicBool::new(false));
+            let control =
+                match ces::types::try_arc(AtomicBool::new(false), "server control allocation") {
+                    Ok(control) => control,
+                    Err(failure) => {
+                        report(failure.stage, failure.code);
+                        return ExitCode::Network;
+                    }
+                };
             // Only one server runs per process, so the first registration wins.
             let _ = CONTROL.set(Arc::clone(&control));
             let registered = unsafe {
@@ -50,7 +56,10 @@ fn run(options: &Options) -> ExitCode {
             };
             if !registered.as_bool() {
                 let error = NativeError::last("SetConsoleCtrlHandler");
-                report(error.stage, error.code);
+                write_stderr(format_args!(
+                    "SetConsoleCtrlHandler failed: {}\n",
+                    error.code as u32
+                ));
                 return ExitCode::Internal;
             }
             let result = run_server(options, &control);
@@ -65,15 +74,17 @@ fn run(options: &Options) -> ExitCode {
 }
 
 fn main() -> ProcessExitCode {
-    // Preserve Windows UTF-16 so malformed surrogates produce the baseline's usage
-    // diagnostic instead of being silently replaced or panicking during UTF-8 decoding.
-    let arguments: Vec<Vec<u16>> = std::env::args_os()
-        .map(|value| value.encode_wide().collect())
-        .collect();
-    let options = match parse_wide(&arguments) {
+    let arguments = match WideArguments::current() {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            report(error.stage, error.code);
+            return ProcessExitCode::from(ExitCode::Network as u8);
+        }
+    };
+    let options = match parse_native(&arguments) {
         Ok(options) => options,
         Err(error) => {
-            eprintln!("Invalid arguments: {}", error.0);
+            write_stderr(format_args!("Invalid arguments: {}\n", error.0));
             help_error();
             return ProcessExitCode::from(ExitCode::Usage as u8);
         }
