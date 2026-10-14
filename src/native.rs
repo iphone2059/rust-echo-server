@@ -344,7 +344,8 @@ impl<T: Send + 'static> NativeThread<T> {
         .map_err(NativeError::from)?;
         // Transfer the Box into raw ownership before deriving the callback pointer.
         // Moving a live Box after pointer derivation can invalidate its provenance.
-        let state = core::ptr::NonNull::new(Box::into_raw(state)).unwrap();
+        let state = core::ptr::NonNull::new(Box::into_raw(state))
+            .unwrap_or_else(|| fail_fast("native thread packet", crate::types::ERROR_INVALID_DATA));
         let parameter = state.as_ptr().cast::<c_void>();
         // SAFETY: raw ownership prevents Box retagging while the callback borrows
         // the packet. On success storage survives until Join; failure starts no callback.

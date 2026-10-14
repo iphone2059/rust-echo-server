@@ -561,10 +561,17 @@ pub fn try_boxed_slice_with<T>(
         initialized: 0,
     };
     for index in 0..count {
-        owner.values.as_mut().unwrap()[index].write(make(index));
+        owner
+            .values
+            .as_mut()
+            .ok_or_else(|| Failure::allocation(stage))?[index]
+            .write(make(index));
         owner.initialized += 1;
     }
-    let values = owner.values.take().unwrap();
+    let values = owner
+        .values
+        .take()
+        .ok_or_else(|| Failure::allocation(stage))?;
     // SAFETY: every entry was initialized above; the guard no longer owns the slice.
     Ok(unsafe { values.assume_init() })
 }

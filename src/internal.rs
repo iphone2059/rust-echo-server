@@ -100,6 +100,28 @@ pub mod acceptor {
         None,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum HandoffDisposition {
+        Withdraw,
+        Fatal,
+        Handoff,
+    }
+
+    pub fn handoff_disposition(
+        stopping: bool,
+        failed: bool,
+        listener_valid: bool,
+        accepted_valid: bool,
+    ) -> HandoffDisposition {
+        if stopping || failed || !listener_valid {
+            HandoffDisposition::Withdraw
+        } else if !accepted_valid {
+            HandoffDisposition::Fatal
+        } else {
+            HandoffDisposition::Handoff
+        }
+    }
+
     /// A peer that resets before AcceptEx completes aborts that single incoming connection;
     /// These three statuses abort only the incoming connection. Everything else keeps the
     /// baseline's fatal classification so real listener or IOCP damage stops admission instead
@@ -118,11 +140,6 @@ pub mod acceptor {
     }
 
     impl AcceptorCore {
-        /// Cold convenience constructor; production initialization uses `try_new`.
-        pub fn new(operation_count: u32, worker_count: u32) -> Self {
-            Self::try_new(operation_count, worker_count).expect("acceptor core allocation")
-        }
-
         pub fn try_new(
             operation_count: u32,
             worker_count: u32,
@@ -304,11 +321,6 @@ pub mod acceptor {
     unsafe impl Sync for AcceptTable {}
 
     impl AcceptTable {
-        /// Cold convenience constructor; production initialization uses `try_new`.
-        pub fn new(operation_count: u32, port: crate::native::SendHandle) -> Self {
-            Self::try_new(operation_count, port).expect("AcceptEx table allocation")
-        }
-
         pub fn try_new(
             operation_count: u32,
             port: crate::native::SendHandle,
@@ -423,6 +435,38 @@ pub mod acceptor {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        impl AcceptorCore {
+            pub fn new(operation_count: u32, worker_count: u32) -> Self {
+                Self::try_new(operation_count, worker_count).expect("acceptor core allocation")
+            }
+        }
+
+        impl AcceptTable {
+            pub fn new(operation_count: u32, port: crate::native::SendHandle) -> Self {
+                Self::try_new(operation_count, port).expect("AcceptEx table allocation")
+            }
+        }
+
+        #[test]
+        fn handoff_disposition_truth_table() {
+            use HandoffDisposition::{Fatal, Handoff, Withdraw};
+            let expected = [
+                Withdraw, Withdraw, Withdraw, Withdraw, Fatal, Withdraw, Withdraw, Withdraw,
+                Withdraw, Withdraw, Withdraw, Withdraw, Handoff, Withdraw, Withdraw, Withdraw,
+            ];
+            for bits in 0..16 {
+                let stopping = bits & 1 != 0;
+                let failed = bits & 2 != 0;
+                let listener_valid = bits & 4 != 0;
+                let accepted_valid = bits & 8 != 0;
+                assert_eq!(
+                    handoff_disposition(stopping, failed, listener_valid, accepted_valid),
+                    expected[bits],
+                    "bits={bits}"
+                );
+            }
+        }
 
         #[test]
         fn every_operation_is_posted_at_startup() {
@@ -997,11 +1041,6 @@ pub mod udp {
     }
 
     impl UdpEngine {
-        /// Cold convenience constructor; production initialization uses `try_new`.
-        pub fn new(depth: u32, payload_bytes: u32) -> Self {
-            Self::try_new(depth, payload_bytes).expect("UDP engine allocation")
-        }
-
         pub fn try_new(depth: u32, payload_bytes: u32) -> Result<Self, crate::types::Failure> {
             Ok(Self {
                 slots: crate::types::try_vec_with(
@@ -1244,6 +1283,12 @@ pub mod udp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        impl UdpEngine {
+            pub fn new(depth: u32, payload_bytes: u32) -> Self {
+                Self::try_new(depth, payload_bytes).expect("UDP engine allocation")
+            }
+        }
 
         fn started(depth: u32) -> UdpEngine {
             let mut engine = UdpEngine::new(depth, 65_507);
@@ -2945,8 +2990,6 @@ pub mod worker {
         use core::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, OnceLock};
         use std::thread;
-        #[cfg(test)]
-        use std::thread::JoinHandle;
         use std::time::Duration;
 
         use windows::Win32::mswsock::{LPFN_ACCEPTEX, LPFN_GETACCEPTEXSOCKADDRS};
@@ -2954,7 +2997,7 @@ pub mod worker {
 
         use crate::acceptor::{
             AcceptAction, AcceptState, AcceptTable, AcceptorCore, AdmissionCredits,
-            accept_error_is_recoverable,
+            HandoffDisposition, accept_error_is_recoverable, handoff_disposition,
         };
         use crate::contract::{
             accept_operation_count, tcp_connection_capacity, worker_memory_budget,
@@ -2982,6 +3025,19 @@ pub mod worker {
             Withdrawn,
             Failed,
             Rejected,
+        }
+
+        fn require_handoff_disposition(
+            stopping: bool,
+            failed: bool,
+            listener_valid: bool,
+            accepted_valid: bool,
+        ) -> HandoffDisposition {
+            let disposition = handoff_disposition(stopping, failed, listener_valid, accepted_valid);
+            if disposition == HandoffDisposition::Fatal {
+                fail_fast("AcceptEx handoff invariant", 10038);
+            }
+            disposition
         }
 
         /// One worker's control surface: the port the acceptor hands sockets to and the join handle
@@ -3705,19 +3761,17 @@ pub mod worker {
             /// Applies the accept context, transfers the socket to the worker and posts the
             /// handoff. Ownership leaves this thread with the transfer.
             fn handoff(&mut self, index: u32, worker: u32) -> HandoffOutcome {
-                if self.core.stopping
-                    || self.failure.load(Ordering::Acquire)
-                    || self.listener.raw() == INVALID_SOCKET
+                if require_handoff_disposition(
+                    self.core.stopping,
+                    self.failure.load(Ordering::Acquire),
+                    self.listener.raw() != INVALID_SOCKET,
+                    self.operation_sockets[index as usize].raw() != INVALID_SOCKET,
+                ) == HandoffDisposition::Withdraw
                 {
                     self.close_accept_socket(index);
                     return HandoffOutcome::Withdrawn;
                 }
                 let socket = self.operation_sockets[index as usize].release();
-                if socket == INVALID_SOCKET {
-                    // The socket is gone because the acceptor closed it while unposting; a stop
-                    // that raced a successful completion lands here.
-                    return HandoffOutcome::Withdrawn;
-                }
                 self.table.store_socket(index, socket);
                 if update_accept_context(socket, self.listener.raw()).is_err() {
                     self.statistics.network_errors = self.statistics.network_errors.wrapping_add(1);
@@ -3781,9 +3835,80 @@ pub mod worker {
             use super::*;
             use core::ffi::c_void;
             use std::cell::RefCell;
+            use std::thread::JoinHandle;
             use windows::Win32::minwinbase::OVERLAPPED;
             use windows::Win32::winsock2::{SOCKET, WSAGetLastError, WSASetLastError, getsockopt};
             use windows::Win32::ws2::{SO_TYPE, SOL_SOCKET};
+
+            #[test]
+            fn handoff_invariant_process_contract() {
+                const CHILD_MODE: &str = "CES_HANDOFF_TEST_CHILD";
+                if let Ok(mode) = std::env::var(CHILD_MODE) {
+                    if mode == "invalid" {
+                        require_handoff_disposition(false, false, true, false);
+                        panic!("healthy invalid socket did not fail fast");
+                    }
+                    assert_eq!(mode, "positive");
+                    assert_eq!(
+                        require_handoff_disposition(false, false, true, true),
+                        HandoffDisposition::Handoff
+                    );
+                    assert_eq!(
+                        require_handoff_disposition(true, false, true, false),
+                        HandoffDisposition::Withdraw
+                    );
+                    assert_eq!(
+                        require_handoff_disposition(false, true, true, false),
+                        HandoffDisposition::Withdraw
+                    );
+                    assert_eq!(
+                        require_handoff_disposition(false, false, false, false),
+                        HandoffDisposition::Withdraw
+                    );
+                    return;
+                }
+                for (mode, expected_exit) in [("positive", 0), ("invalid", 4)] {
+                    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "handoff_invariant_process_contract",
+                            "--nocapture",
+                            "--test-threads=1",
+                        ])
+                        .env(CHILD_MODE, mode)
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        if child.try_wait().unwrap().is_some() {
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            child.kill().unwrap();
+                            child.wait().unwrap();
+                            panic!("handoff {mode} exceeded its 10 second bound");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    let output = child.wait_with_output().unwrap();
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert_eq!(
+                        output.status.code(),
+                        Some(expected_exit),
+                        "mode={mode}: {stderr}"
+                    );
+                    if mode == "invalid" {
+                        assert!(
+                            stderr
+                                .contains("AcceptEx handoff invariant failed: native_error=10038"),
+                            "{stderr}"
+                        );
+                    } else {
+                        assert!(stderr.is_empty(), "{stderr}");
+                    }
+                }
+            }
 
             static ACCEPT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -4101,11 +4226,6 @@ pub mod worker {
         }
 
         impl TimerHeap {
-            /// Cold convenience constructor; production initialization uses `try_new`.
-            pub fn new(capacity: usize) -> Self {
-                Self::try_new(capacity).expect("timer allocation")
-            }
-
             pub fn try_new(capacity: usize) -> Result<Self, crate::types::Failure> {
                 Ok(Self {
                     capacity,
@@ -4306,6 +4426,12 @@ pub mod worker {
         mod tests {
             use super::*;
             use crate::types::WAIT_TIMEOUT;
+
+            impl TimerHeap {
+                pub fn new(capacity: usize) -> Self {
+                    Self::try_new(capacity).expect("timer allocation")
+                }
+            }
 
             fn xorshift(state: &mut u32) -> u32 {
                 let mut value = *state;

@@ -15,6 +15,13 @@ $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $ServerPath -PathType Leaf)) { throw "server executable not found: $ServerPath" }
 if (-not (Test-Path -LiteralPath $ClientPath -PathType Leaf)) { throw "client executable not found: $ClientPath" }
 
+$artifactRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'target/interop-artifacts'
+$runName = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffffffZ') + '-' + [Guid]::NewGuid().ToString('N')
+$runDirectory = Join-Path $artifactRoot $runName
+$null = New-Item -Path $runDirectory -ItemType Directory -Force
+$scenarioIndex = 0
+Write-Host "Interop artifacts: $runDirectory"
+
 function Get-FreeTcpPort {
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
@@ -35,15 +42,25 @@ function Invoke-Scenario {
         [string[]] $ClientArguments,
         [int] $ServerRunSeconds
     )
-    $output = [System.IO.Path]::GetTempFileName()
-    $errorFile = [System.IO.Path]::GetTempFileName()
+    $script:scenarioIndex++
+    $scenarioName = '{0:D2}-{1}' -f $script:scenarioIndex, ($Label -replace '[^a-zA-Z0-9]+', '-')
+    $scenarioDirectory = Join-Path $runDirectory $scenarioName
+    $null = New-Item -Path $scenarioDirectory -ItemType Directory -Force
+    $output = Join-Path $scenarioDirectory 'server.stdout.log'
+    $errorFile = Join-Path $scenarioDirectory 'server.stderr.log'
+    $clientOutputFile = Join-Path $scenarioDirectory 'client.stdout.log'
+    $clientErrorFile = Join-Path $scenarioDirectory 'client.stderr.log'
     $arguments = @('/p', $Protocol, '/s', $Port) + $ServerArguments
+    $clientCode = $null
+    $scenarioError = $null
+    $serverKilled = $false
     $server = Start-Process -FilePath $ServerPath -ArgumentList $arguments -RedirectStandardOutput $output -RedirectStandardError $errorFile -PassThru -NoNewWindow
     try {
         Start-Sleep -Milliseconds 400
         if ($server.HasExited) { throw "$Label server exited early with code $($server.ExitCode)" }
-        $clientOutput = & $ClientPath @ClientArguments 2>&1
+        & $ClientPath @ClientArguments 1> $clientOutputFile 2> $clientErrorFile
         $clientCode = $LASTEXITCODE
+        $clientOutput = @(Get-Content -LiteralPath $clientOutputFile) + @(Get-Content -LiteralPath $clientErrorFile)
         if ($clientCode -ne 0) { throw "$Label client exited with $clientCode" }
         $summary = ($clientOutput | Where-Object { $_ -match 'corrupted=' } | Select-Object -Last 1)
         if ($summary -notmatch 'corrupted=0 lost=0') { throw "$Label client reported loss: $summary" }
@@ -53,10 +70,27 @@ function Invoke-Scenario {
             $text = (Get-Content -LiteralPath $errorFile -Raw) ?? ''
             throw "$Label server exited with $($server.ExitCode): $text"
         }
+    } catch {
+        $scenarioError = $_.ToString()
+        throw
     } finally {
-        if (-not $server.HasExited) { $server.Kill($true) }
+        $serverExitCode = if ($server.HasExited) { $server.ExitCode } else { $null }
+        if (-not $server.HasExited) { $server.Kill($true); $serverKilled = $true }
+        [ordered]@{
+            label = $Label
+            server_path = $ServerPath
+            server_sha256 = (Get-FileHash -LiteralPath $ServerPath).Hash
+            client_path = $ClientPath
+            client_sha256 = (Get-FileHash -LiteralPath $ClientPath).Hash
+            server_arguments = $arguments
+            client_arguments = $ClientArguments
+            server_run_seconds = $ServerRunSeconds
+            client_exit_code = $clientCode
+            server_exit_code_before_cleanup = $serverExitCode
+            server_killed_for_cleanup = $serverKilled
+            error = $scenarioError
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $scenarioDirectory 'scenario.json') -Encoding utf8
         $server.Dispose()
-        Remove-Item -LiteralPath $output, $errorFile -Force -ErrorAction SilentlyContinue
     }
 }
 

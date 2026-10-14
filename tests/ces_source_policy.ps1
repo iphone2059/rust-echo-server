@@ -98,7 +98,7 @@ function Test-RustPattern {
         }
         foreach ($match in [regex]::Matches($text, $Pattern)) {
             $line = ($text.Substring(0, $match.Index) -split "`n").Count
-            $failures.Add("${Label}: ${($file.FullName)}:${line}")
+            $failures.Add("${Label}: $($file.FullName):${line}")
         }
     }
 }

@@ -52,11 +52,6 @@ pub struct TcpEngine {
 }
 
 impl TcpEngine {
-    /// Cold convenience constructor; production initialization uses `try_new`.
-    pub fn new(slot_count: u32, timeout_milliseconds: u64) -> Self {
-        Self::try_new(slot_count, timeout_milliseconds).expect("TCP engine allocation")
-    }
-
     pub fn try_new(
         slot_count: u32,
         timeout_milliseconds: u64,
@@ -425,6 +420,12 @@ mod tests {
     use super::*;
     use crate::connection::ConnectionState;
     use crate::types::Protocol;
+
+    impl TcpEngine {
+        pub fn new(slot_count: u32, timeout_milliseconds: u64) -> Self {
+            Self::try_new(slot_count, timeout_milliseconds).expect("TCP engine allocation")
+        }
+    }
 
     fn engine(slots: u32) -> TcpEngine {
         let mut engine = TcpEngine::new(slots, 5_000);
