@@ -2,3 +2,5 @@
 /Cargo.lock
 *.pdb
 *.exe
+# Verification artifacts (latest.csv, latest-summary.csv, archive/, cases/)
+tools/verification/results/
