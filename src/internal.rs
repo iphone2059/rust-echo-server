@@ -2182,6 +2182,10 @@ pub mod worker {
     pub struct Request {
         pub connection_index: u32,
         pub operation: EngineOperation,
+        /// The generation that posted this context. The context address is stable for the slot's
+        /// lifetime, so the tag travels with it and a completion can be told apart from one of an
+        /// earlier generation even when the slot has since been adopted again.
+        pub generation: u32,
     }
 
     /// One connection slot's native state. The socket and the request queue exist only while
@@ -2189,6 +2193,9 @@ pub mod worker {
     #[repr(C)]
     struct ConnectionRuntime {
         request: Request,
+        /// Identity of the generation currently adopted into this slot. It changes only where a
+        /// handoff adopts the slot, so a stale completion can be rejected instead of attributed.
+        generation: u32,
         socket: SocketOwner,
         request_queue: Option<RequestQueue>,
         buffer: RIO_BUF,
@@ -2350,7 +2357,9 @@ pub mod worker {
                     request: Request {
                         connection_index: slot as u32,
                         operation: EngineOperation::Receive,
+                        generation: 0,
                     },
+                    generation: 0,
                     socket: SocketOwner::new(INVALID_SOCKET),
                     request_queue: None,
                     buffer: RIO_BUF::default(),
@@ -2711,6 +2720,9 @@ pub mod worker {
                     if operation != runtime.request.operation {
                         fail_fast("worker completion operation", ERROR_INVALID_DATA);
                     }
+                    if runtime.request.generation != runtime.generation {
+                        fail_fast("worker completion generation", ERROR_INVALID_DATA);
+                    }
                     if result.BytesTransferred > runtime.posted_length {
                         fail_fast("worker completion exceeds posted range", ERROR_INVALID_DATA);
                     }
@@ -2941,6 +2953,15 @@ pub mod worker {
                     runtime.buffer = buffer;
                     runtime.request_queue = Some(queue);
                     runtime.request.operation = EngineOperation::Receive;
+                    // This is the slot's only reuse point, so it is where the generation changes. The
+                    // request context is retagged before any operation of the new generation can be
+                    // posted. The tag is an identity rather than an ownership ledger.
+                    runtime.generation = if runtime.generation == u32::MAX {
+                        1
+                    } else {
+                        runtime.generation + 1
+                    };
+                    runtime.request.generation = runtime.generation;
                     core::mem::swap(&mut runtime.socket, &mut socket);
                 }
                 Err(error) => {
