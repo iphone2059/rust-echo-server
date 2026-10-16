@@ -134,9 +134,15 @@ impl TcpEngine {
 
     /// Gives a taken slot back without adopting it (the request queue could not be made).
     pub fn return_slot(&mut self, index: u32) {
-        if let Some(connection) = self.connections.get_mut(index as usize) {
-            connection.state = crate::connection::ConnectionState::Idle;
+        if index as usize >= self.connections.len()
+            || self.free_indices.len() >= self.connections.len()
+            || self.free_indices.contains(&index)
+        {
+            self.fatal = true;
+            self.failure = Some(crate::types::Failure::invariant("TCP return slot ownership"));
+            return;
         }
+        self.connections[index as usize].state = crate::connection::ConnectionState::Idle;
         self.free_indices.push(index);
     }
 
