@@ -37,6 +37,11 @@ pub struct TcpEngine {
     timers: TimerHeap,
     /// Free slot stack: a released index is pushed here and popped by the next handoff.
     free_indices: Vec<u32>,
+    /// O(1) ownership mirror of the free list: true while the slot is owned by a worker (taken or
+    /// admitted) and false while it sits in the free list. The free list alone cannot answer "was
+    /// this slot already returned?" without a scan, and a scan cannot tell a duplicate index from a
+    /// legitimate one, so ownership is tracked as its own bit per slot.
+    slot_owned: Vec<bool>,
     timeout_milliseconds: u64,
     active_connections: u32,
     rio_outstanding: u32,
@@ -68,6 +73,10 @@ impl TcpEngine {
             })?,
             timers: TimerHeap::try_new(count)?,
             free_indices,
+            // Every slot starts free, so no slot is owned yet.
+            slot_owned: crate::types::try_vec_with(count, "TCP slot ownership allocation", |_| {
+                false
+            })?,
             timeout_milliseconds,
             active_connections: 0,
             rio_outstanding: 0,
@@ -115,7 +124,16 @@ impl TcpEngine {
         if self.stopping {
             return None;
         }
-        self.free_indices.pop()
+        let index = self.free_indices.pop()?;
+        // A free-list entry that is out of range, or that still claims ownership, means the two
+        // views of the pool have diverged: hand out nothing and let the worker fail fast.
+        if index as usize >= self.connections.len() || self.slot_owned[index as usize] {
+            self.fatal = true;
+            self.failure = Some(crate::types::Failure::invariant("TCP take slot ownership"));
+            return None;
+        }
+        self.slot_owned[index as usize] = true;
+        Some(index)
     }
 
     /// True while the worker is draining. A socket withdrawn then is a shutdown, not a capacity
@@ -137,11 +155,12 @@ impl TcpEngine {
     /// Slot ownership is an invariant, not a hint: only a slot that was taken may come back, it may
     /// come back once, and the free list can never hold more entries than there are slots. A
     /// violation means the accounting is already broken, so it fails the engine instead of writing
-    /// an out-of-range or duplicated index into the free list.
+    /// an out-of-range or duplicated index into the free list. The ownership bit answers the
+    /// duplicate question in O(1), so the check never scans the free list.
     pub fn return_slot(&mut self, index: u32) {
         if index as usize >= self.connections.len()
+            || !self.slot_owned[index as usize]
             || self.free_indices.len() >= self.connections.len()
-            || self.free_indices.contains(&index)
         {
             self.fatal = true;
             self.failure = Some(crate::types::Failure::invariant(
@@ -149,28 +168,34 @@ impl TcpEngine {
             ));
             return;
         }
+        self.slot_owned[index as usize] = false;
         self.connections[index as usize].state = crate::connection::ConnectionState::Idle;
         self.free_indices.push(index);
     }
 
     /// Adopts a taken slot and arms its first receive.
+    ///
+    /// `Connection::admit` resets the record, so every ownership precondition is checked *before*
+    /// it runs: the pool must have handed this slot out, the connection must be idle with nothing in
+    /// flight, and both engine counters must still have room. Checking afterwards could only observe
+    /// the state this function had just written.
     pub fn admit(&mut self, index: u32, now: u64) -> Option<Step> {
         let timeout = self.timeout_milliseconds;
+        let owned = index as usize;
+        let admissible = owned < self.connections.len()
+            && self.slot_owned[owned]
+            && self.connections[owned].is_idle()
+            && self.connections[owned].outstanding == 0
+            && self.active_connections != u32::MAX
+            && self.rio_outstanding != u32::MAX;
+        if !admissible {
+            self.fatal = true;
+            self.failure = Some(crate::types::Failure::invariant("TCP admission ownership"));
+            return None;
+        }
         let deadline = {
-            let connection = self.connections.get_mut(index as usize)?;
+            let connection = &mut self.connections[owned];
             connection.admit(now, timeout);
-            // Ownership counters never saturate: reaching the maximum means the accounting itself is
-            // broken, and a frozen counter would hide the next release as well.
-            if connection.outstanding == u32::MAX
-                || self.active_connections == u32::MAX
-                || self.rio_outstanding == u32::MAX
-            {
-                self.fatal = true;
-                self.failure = Some(crate::types::Failure::invariant(
-                    "TCP admission ownership counter overflow",
-                ));
-                return None;
-            }
             connection.outstanding += 1;
             connection.deadline
         };
@@ -444,10 +469,33 @@ impl TcpEngine {
                 Some(Step::Close { index })
             }
             ConnectionStep::CloseAndRelease => {
-                self.timers.remove(index);
-                if let Some(connection) = self.connections.get_mut(index as usize) {
-                    connection.state = crate::connection::ConnectionState::Idle;
+                // The whole release precondition is evaluated before the first mutation: a rejected
+                // release must not have moved the free list, dropped the timer, changed the state or
+                // decremented a counter, or the engine would fail fast holding a half-released slot.
+                let owned = index as usize;
+                if owned >= self.connections.len() || !self.slot_owned[owned] {
+                    self.fatal = true;
+                    self.failure = Some(crate::types::Failure::invariant(
+                        "TCP release slot ownership",
+                    ));
+                    return None;
                 }
+                if self.connections[owned].outstanding != 0 {
+                    self.fatal = true;
+                    self.failure =
+                        Some(crate::types::Failure::invariant("TCP release outstanding"));
+                    return None;
+                }
+                if self.active_connections == 0 {
+                    self.fatal = true;
+                    self.failure = Some(crate::types::Failure::invariant(
+                        "TCP active connection underflow",
+                    ));
+                    return None;
+                }
+                self.timers.remove(index);
+                self.slot_owned[owned] = false;
+                self.connections[owned].state = crate::connection::ConnectionState::Idle;
                 self.free_indices.push(index);
                 self.active_connections -= 1;
                 Some(Step::Release { index })
