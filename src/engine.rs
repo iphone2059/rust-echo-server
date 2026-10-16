@@ -32,16 +32,37 @@ pub enum Step {
     },
 }
 
+/// Slot ownership, the single truth about who holds a slot.
+///
+/// ```text
+/// Free --take--> Reserved --admit--> Active --close--> Draining --release--> Free
+///   ^                |                                                  |
+///   +---- return ----+                                                  |
+///   +------------------------------------------------------------------+
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotOwnership {
+    /// In the free list: holds no native operation and may be taken.
+    Free,
+    /// Taken out of the free list; the request queue and the socket handoff are not complete yet.
+    Reserved,
+    /// A generation is admitted, so native operations may be in flight.
+    Active,
+    /// Closing: no new operation is submitted, and the posted ones retire through the completion
+    /// queue before the slot can be released.
+    Draining,
+}
+
 pub struct TcpEngine {
     connections: Vec<Connection>,
     timers: TimerHeap,
     /// Free slot stack: a released index is pushed here and popped by the next handoff.
     free_indices: Vec<u32>,
-    /// O(1) ownership mirror of the free list: true while the slot is owned by a worker (taken or
-    /// admitted) and false while it sits in the free list. The free list alone cannot answer "was
-    /// this slot already returned?" without a scan, and a scan cannot tell a duplicate index from a
-    /// legitimate one, so ownership is tracked as its own bit per slot.
-    slot_owned: Vec<bool>,
+    /// Per-slot ownership, indexed by slot index. The free list answers "which index comes next",
+    /// but it is not the ownership truth: it cannot answer "was this slot already returned?"
+    /// without a scan. `Connection::state` cannot answer it either, because that is the business
+    /// state of a connection, not the ownership of a slot.
+    slot_ownership: Vec<SlotOwnership>,
     timeout_milliseconds: u64,
     active_connections: u32,
     rio_outstanding: u32,
@@ -74,9 +95,11 @@ impl TcpEngine {
             timers: TimerHeap::try_new(count)?,
             free_indices,
             // Every slot starts free, so no slot is owned yet.
-            slot_owned: crate::types::try_vec_with(count, "TCP slot ownership allocation", |_| {
-                false
-            })?,
+            slot_ownership: crate::types::try_vec_with(
+                count,
+                "TCP slot ownership allocation",
+                |_| SlotOwnership::Free,
+            )?,
             timeout_milliseconds,
             active_connections: 0,
             rio_outstanding: 0,
@@ -125,14 +148,14 @@ impl TcpEngine {
             return None;
         }
         let index = self.free_indices.pop()?;
-        // A free-list entry that is out of range, or that still claims ownership, means the two
-        // views of the pool have diverged: hand out nothing and let the worker fail fast.
-        if index as usize >= self.connections.len() || self.slot_owned[index as usize] {
+        // Free -> Reserved. A free-list entry that is out of range, or whose slot is not actually
+        // free, means the free list and the ownership table have diverged: hand out nothing.
+        if self.slot_ownership.get(index as usize) != Some(&SlotOwnership::Free) {
             self.fatal = true;
             self.failure = Some(crate::types::Failure::invariant("TCP take slot ownership"));
             return None;
         }
-        self.slot_owned[index as usize] = true;
+        self.slot_ownership[index as usize] = SlotOwnership::Reserved;
         Some(index)
     }
 
@@ -155,21 +178,25 @@ impl TcpEngine {
     /// Slot ownership is an invariant, not a hint: only a slot that was taken may come back, it may
     /// come back once, and the free list can never hold more entries than there are slots. A
     /// violation means the accounting is already broken, so it fails the engine instead of writing
-    /// an out-of-range or duplicated index into the free list. The ownership bit answers the
+    /// an out-of-range or duplicated index into the free list. The ownership state answers the
     /// duplicate question in O(1), so the check never scans the free list.
     pub fn return_slot(&mut self, index: u32) {
-        if index as usize >= self.connections.len()
-            || !self.slot_owned[index as usize]
-            || self.free_indices.len() >= self.connections.len()
-        {
+        // Reserved -> Free. Only a slot that was taken and never admitted may come back, it may
+        // come back once, and it must hold nothing the provider could still reach: no unretired
+        // operation (the request queue and any admission credit belong to the caller, which returns
+        // the slot only after that handoff failed).
+        let returnable = self.slot_ownership.get(index as usize) == Some(&SlotOwnership::Reserved)
+            && self.free_indices.len() < self.connections.len()
+            && self.connections[index as usize].outstanding == 0;
+        if !returnable {
             self.fatal = true;
             self.failure = Some(crate::types::Failure::invariant(
                 "TCP return slot ownership",
             ));
             return;
         }
-        self.slot_owned[index as usize] = false;
         self.connections[index as usize].state = crate::connection::ConnectionState::Idle;
+        self.slot_ownership[index as usize] = SlotOwnership::Free;
         self.free_indices.push(index);
     }
 
@@ -182,8 +209,12 @@ impl TcpEngine {
     pub fn admit(&mut self, index: u32, now: u64) -> Option<Step> {
         let timeout = self.timeout_milliseconds;
         let owned = index as usize;
+        // Reserved -> Active. `Connection::admit` resets the record, so every precondition is
+        // checked before it runs: the slot must be the one the pool handed out, it must be idle with
+        // nothing in flight, and both engine counters must still have room. Checking afterwards
+        // could only observe the state this function had just written.
         let admissible = owned < self.connections.len()
-            && self.slot_owned[owned]
+            && self.slot_ownership[owned] == SlotOwnership::Reserved
             && self.connections[owned].is_idle()
             && self.connections[owned].outstanding == 0
             && self.active_connections != u32::MAX
@@ -199,6 +230,7 @@ impl TcpEngine {
             connection.outstanding += 1;
             connection.deadline
         };
+        self.slot_ownership[owned] = SlotOwnership::Active;
         self.statistics.accepted = self.statistics.accepted.wrapping_add(1);
         self.active_connections += 1;
         self.rio_outstanding += 1;
@@ -418,7 +450,28 @@ impl TcpEngine {
         worker_may_exit(&self.lifecycle()) && self.timers.is_empty()
     }
 
+    /// Active -> Draining. Every path that can change a connection's business state reports its
+    /// step through `apply`, so the ownership transition lives here instead of in each caller: a
+    /// connection that has begun closing (or already released its record) can no longer submit
+    /// normal work, and its slot stays draining until the last completion retires it.
+    fn sync_draining(&mut self, index: u32) {
+        let Some(connection) = self.connections.get(index as usize) else {
+            return;
+        };
+        if !connection.is_closing()
+            && connection.state != crate::connection::ConnectionState::Released
+        {
+            return;
+        }
+        if let Some(ownership) = self.slot_ownership.get_mut(index as usize) {
+            if *ownership == SlotOwnership::Active {
+                *ownership = SlotOwnership::Draining;
+            }
+        }
+    }
+
     fn apply(&mut self, index: u32, step: ConnectionStep) -> Option<Step> {
+        self.sync_draining(index);
         match step {
             ConnectionStep::None => {
                 // The operation in flight keeps its deadline.
@@ -469,11 +522,12 @@ impl TcpEngine {
                 Some(Step::Close { index })
             }
             ConnectionStep::CloseAndRelease => {
-                // The whole release precondition is evaluated before the first mutation: a rejected
-                // release must not have moved the free list, dropped the timer, changed the state or
-                // decremented a counter, or the engine would fail fast holding a half-released slot.
+                // Draining -> Free. The whole release precondition is evaluated before the first
+                // mutation: a rejected release must not have moved the free list, dropped the timer,
+                // changed the state or decremented a counter, or the engine would fail fast holding a
+                // half-released slot.
                 let owned = index as usize;
-                if owned >= self.connections.len() || !self.slot_owned[owned] {
+                if self.slot_ownership.get(owned) != Some(&SlotOwnership::Draining) {
                     self.fatal = true;
                     self.failure = Some(crate::types::Failure::invariant(
                         "TCP release slot ownership",
@@ -494,8 +548,8 @@ impl TcpEngine {
                     return None;
                 }
                 self.timers.remove(index);
-                self.slot_owned[owned] = false;
                 self.connections[owned].state = crate::connection::ConnectionState::Idle;
+                self.slot_ownership[owned] = SlotOwnership::Free;
                 self.free_indices.push(index);
                 self.active_connections -= 1;
                 Some(Step::Release { index })
