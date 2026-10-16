@@ -133,10 +133,23 @@ impl TcpEngine {
     }
 
     /// Gives a taken slot back without adopting it (the request queue could not be made).
+    ///
+    /// Slot ownership is an invariant, not a hint: only a slot that was taken may come back, it may
+    /// come back once, and the free list can never hold more entries than there are slots. A
+    /// violation means the accounting is already broken, so it fails the engine instead of writing
+    /// an out-of-range or duplicated index into the free list.
     pub fn return_slot(&mut self, index: u32) {
-        if let Some(connection) = self.connections.get_mut(index as usize) {
-            connection.state = crate::connection::ConnectionState::Idle;
+        if index as usize >= self.connections.len()
+            || self.free_indices.len() >= self.connections.len()
+            || self.free_indices.contains(&index)
+        {
+            self.fatal = true;
+            self.failure = Some(crate::types::Failure::invariant(
+                "TCP return slot ownership",
+            ));
+            return;
         }
+        self.connections[index as usize].state = crate::connection::ConnectionState::Idle;
         self.free_indices.push(index);
     }
 
@@ -146,7 +159,19 @@ impl TcpEngine {
         let deadline = {
             let connection = self.connections.get_mut(index as usize)?;
             connection.admit(now, timeout);
-            connection.outstanding = connection.outstanding.saturating_add(1);
+            // Ownership counters never saturate: reaching the maximum means the accounting itself is
+            // broken, and a frozen counter would hide the next release as well.
+            if connection.outstanding == u32::MAX
+                || self.active_connections == u32::MAX
+                || self.rio_outstanding == u32::MAX
+            {
+                self.fatal = true;
+                self.failure = Some(crate::types::Failure::invariant(
+                    "TCP admission ownership counter overflow",
+                ));
+                return None;
+            }
+            connection.outstanding += 1;
             connection.deadline
         };
         self.statistics.accepted = self.statistics.accepted.wrapping_add(1);
@@ -268,7 +293,14 @@ impl TcpEngine {
             let connection = self.connections.get_mut(index as usize)?;
             // The step that asked for this post already counted the operation, but RIO
             // never queued it, so the count has to come back down before the close.
-            connection.outstanding = connection.outstanding.saturating_sub(1);
+            if connection.outstanding == 0 {
+                self.fatal = true;
+                self.failure = Some(crate::types::Failure::invariant(
+                    "TCP post failure outstanding underflow",
+                ));
+                return None;
+            }
+            connection.outstanding -= 1;
             connection.close_at(now)
         };
         self.apply(index, step)
@@ -370,7 +402,14 @@ impl TcpEngine {
             ConnectionStep::Receive => {
                 let deadline = {
                     let connection = self.connections.get_mut(index as usize)?;
-                    connection.outstanding = connection.outstanding.saturating_add(1);
+                    if connection.outstanding == u32::MAX || self.rio_outstanding == u32::MAX {
+                        self.fatal = true;
+                        self.failure = Some(crate::types::Failure::invariant(
+                            "TCP posted ownership counter overflow",
+                        ));
+                        return None;
+                    }
+                    connection.outstanding += 1;
                     connection.deadline
                 };
                 self.rio_outstanding += 1;
@@ -380,7 +419,14 @@ impl TcpEngine {
             ConnectionStep::Send { offset, length } => {
                 let deadline = {
                     let connection = self.connections.get_mut(index as usize)?;
-                    connection.outstanding = connection.outstanding.saturating_add(1);
+                    if connection.outstanding == u32::MAX || self.rio_outstanding == u32::MAX {
+                        self.fatal = true;
+                        self.failure = Some(crate::types::Failure::invariant(
+                            "TCP posted ownership counter overflow",
+                        ));
+                        return None;
+                    }
+                    connection.outstanding += 1;
                     connection.deadline
                 };
                 self.rio_outstanding += 1;
