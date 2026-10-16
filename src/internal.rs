@@ -2110,7 +2110,10 @@ pub mod udp {
             runtime.socket.reset();
             // A final real notification may still be pending after all operations retire.
             // Its OVERLAPPED stays alive until the port closes; never forge a delivery.
-            if cfg!(debug_assertions) && !runtime.notification_counters.valid() {
+            // Notification ownership is an invariant in every build: a queue armed for work that
+            // never produced a delivery is a defect in release too, and every other implementation
+            // checks the same accounting unconditionally.
+            if !runtime.notification_counters.valid() {
                 fail_fast("UDP notification accounting", 5023);
             }
             if runtime.engine.outstanding != 0 {
@@ -2593,7 +2596,8 @@ pub mod worker {
             {
                 fail_fast("server worker release precondition", 5023);
             }
-            if cfg!(debug_assertions) && !self.notification_counters.valid() {
+            // Notification ownership is an invariant in every build; see the UDP path above.
+            if !self.notification_counters.valid() {
                 fail_fast("server worker notification accounting", 5023);
             }
         }
