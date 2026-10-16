@@ -146,7 +146,12 @@ impl TcpEngine {
         let deadline = {
             let connection = self.connections.get_mut(index as usize)?;
             connection.admit(now, timeout);
-            connection.outstanding = connection.outstanding.saturating_add(1);
+            if connection.outstanding == u32::MAX || self.active_connections == u32::MAX || self.rio_outstanding == u32::MAX {
+                self.fatal = true;
+                self.failure = Some(crate::types::Failure::invariant("TCP admission ownership counter overflow"));
+                return None;
+            }
+            connection.outstanding += 1;
             connection.deadline
         };
         self.statistics.accepted = self.statistics.accepted.wrapping_add(1);
@@ -268,7 +273,12 @@ impl TcpEngine {
             let connection = self.connections.get_mut(index as usize)?;
             // The step that asked for this post already counted the operation, but RIO
             // never queued it, so the count has to come back down before the close.
-            connection.outstanding = connection.outstanding.saturating_sub(1);
+            if connection.outstanding == 0 {
+                self.fatal = true;
+                self.failure = Some(crate::types::Failure::invariant("TCP post failure outstanding underflow"));
+                return None;
+            }
+            connection.outstanding -= 1;
             connection.close_at(now)
         };
         self.apply(index, step)
@@ -370,7 +380,12 @@ impl TcpEngine {
             ConnectionStep::Receive => {
                 let deadline = {
                     let connection = self.connections.get_mut(index as usize)?;
-                    connection.outstanding = connection.outstanding.saturating_add(1);
+                    if connection.outstanding == u32::MAX || self.rio_outstanding == u32::MAX {
+                        self.fatal = true;
+                        self.failure = Some(crate::types::Failure::invariant("TCP posted ownership counter overflow"));
+                        return None;
+                    }
+                    connection.outstanding += 1;
                     connection.deadline
                 };
                 self.rio_outstanding += 1;
@@ -380,7 +395,12 @@ impl TcpEngine {
             ConnectionStep::Send { offset, length } => {
                 let deadline = {
                     let connection = self.connections.get_mut(index as usize)?;
-                    connection.outstanding = connection.outstanding.saturating_add(1);
+                    if connection.outstanding == u32::MAX || self.rio_outstanding == u32::MAX {
+                        self.fatal = true;
+                        self.failure = Some(crate::types::Failure::invariant("TCP posted ownership counter overflow"));
+                        return None;
+                    }
+                    connection.outstanding += 1;
                     connection.deadline
                 };
                 self.rio_outstanding += 1;
