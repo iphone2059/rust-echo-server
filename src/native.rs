@@ -861,7 +861,7 @@ pub mod arena {
     use windows::Win32::mswsockdef::RIO_BUF;
 
     use crate::native::rio::RegisteredBuffer;
-    use crate::native::{NativeError, RioFunctions, report};
+    use crate::native::{NativeError, RioFunctions, fail_fast};
 
     // VirtualAlloc/VirtualFree flag values from winnt.h. The generated tree does not expose
     // them under memoryapi, and the API takes plain u32 flags.
@@ -1050,7 +1050,10 @@ pub mod arena {
                 // a release build and then cleared the pointer, so the whole region leaked silently.
                 if !release_pages(self.base) {
                     let error = NativeError::last("VirtualFree(arena)");
-                    report(error.stage, error.code);
+                    // A failed release means Windows still holds the whole region: that is a release
+                    // boundary invariant rather than a diagnostic, and the C++, Zig and .NET
+                    // implementations fail fast on the same result.
+                    fail_fast(error.stage, error.code);
                 }
                 self.base = core::ptr::null_mut();
                 self.bytes = 0;
