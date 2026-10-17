@@ -847,6 +847,118 @@ pub fn load_accept_addresses(listener: SOCKET) -> Result<LPFN_GETACCEPTEXSOCKADD
 
 // The Windows substrate: the RIO wrappers, the registered arena and the endpoint helpers.
 
+pub mod context {
+    //! Codec for the value RIO carries back as a request context.
+    //!
+    //! The packed value is immutable: the slot, the operation, the generation that posted it and a
+    //! per-slot submission serial are captured when the request is submitted, and the provider
+    //! returns the same value even after the slot record has been rewritten for a new generation.
+    //! A pointer into that record cannot express this, because the retire path would read whatever
+    //! the reuse point has written since.
+
+    use crate::types::EngineOperation;
+
+    /// Tag of the identity a request queue publishes in `RIORESULT::SocketContext`.
+    pub const REQUEST_QUEUE_TAG: u64 = 1;
+    pub const SEND_TAG: u64 = 2;
+    pub const RECEIVE_TAG: u64 = 3;
+
+    /// Context layout on Windows x64: tag (3 bits), slot (16), generation (8), serial (20).
+    ///
+    /// The value is carried through APIs typed as `PVOID`, so it deliberately stays below 2^47
+    /// instead of manufacturing a non-canonical x64 pointer pattern. Slot, generation and serial
+    /// are captured when the request is submitted and the provider returns them unchanged, so a
+    /// completion still describes its own submission after the slot record has been rewritten for
+    /// a later generation. A pointer into that record cannot express this: the retire path would
+    /// read whatever the reuse point has written since.
+    const CONTEXT_TAG_BITS: u32 = 3;
+    const CONTEXT_SLOT_BITS: u32 = 16;
+    const CONTEXT_GENERATION_BITS: u32 = 8;
+    const CONTEXT_SERIAL_BITS: u32 = 20;
+    const CONTEXT_BITS: u32 =
+        CONTEXT_TAG_BITS + CONTEXT_SLOT_BITS + CONTEXT_GENERATION_BITS + CONTEXT_SERIAL_BITS;
+    const _: () = assert!(CONTEXT_BITS == 47);
+    const CONTEXT_MASK: u64 = (1u64 << CONTEXT_BITS) - 1;
+    const CONTEXT_TAG_MASK: u64 = (1u64 << CONTEXT_TAG_BITS) - 1;
+    const CONTEXT_SLOT_MASK: u64 = (1u64 << CONTEXT_SLOT_BITS) - 1;
+    const CONTEXT_GENERATION_MASK: u64 = (1u64 << CONTEXT_GENERATION_BITS) - 1;
+    const CONTEXT_SERIAL_MASK: u64 = (1u64 << CONTEXT_SERIAL_BITS) - 1;
+    const MAXIMUM_CONTEXT_GENERATION: u32 = CONTEXT_GENERATION_MASK as u32;
+    const MAXIMUM_CONTEXT_SERIAL: u32 = CONTEXT_SERIAL_MASK as u32;
+    const NO_CONTEXT_SERIAL: u64 = 0;
+
+    /// A decoded request identity. The generation is the value captured at submission, so it still
+    /// describes that submission after the slot record was rewritten for a later generation.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RequestIdentity {
+        pub slot: u32,
+        pub generation: u32,
+        pub operation: Option<EngineOperation>,
+    }
+
+    pub fn encode_request_context(slot: u32, generation: u32, serial: u32, tag: u64) -> u64 {
+        (tag & CONTEXT_TAG_MASK)
+            | ((u64::from(slot) & CONTEXT_SLOT_MASK) << CONTEXT_TAG_BITS)
+            | ((u64::from(generation) & CONTEXT_GENERATION_MASK)
+                << (CONTEXT_TAG_BITS + CONTEXT_SLOT_BITS))
+            | ((u64::from(serial) & CONTEXT_SERIAL_MASK)
+                << (CONTEXT_TAG_BITS + CONTEXT_SLOT_BITS + CONTEXT_GENERATION_BITS))
+    }
+
+    pub fn decode_request_context(context: u64) -> Option<RequestIdentity> {
+        // Reject rather than mask anything outside the canonical payload: a corrupted or forged
+        // completion key must not be able to alias a live request.
+        if context & !CONTEXT_MASK != 0 {
+            return None;
+        }
+        let operation = match context & CONTEXT_TAG_MASK {
+            REQUEST_QUEUE_TAG => None,
+            SEND_TAG => Some(EngineOperation::Send),
+            RECEIVE_TAG => Some(EngineOperation::Receive),
+            _ => return None,
+        };
+        let slot = (context >> CONTEXT_TAG_BITS) & CONTEXT_SLOT_MASK;
+        let generation =
+            (context >> (CONTEXT_TAG_BITS + CONTEXT_SLOT_BITS)) & CONTEXT_GENERATION_MASK;
+        let serial = (context >> (CONTEXT_TAG_BITS + CONTEXT_SLOT_BITS + CONTEXT_GENERATION_BITS))
+            & CONTEXT_SERIAL_MASK;
+        if generation == 0 {
+            return None;
+        }
+        match operation {
+            Some(_) if serial == NO_CONTEXT_SERIAL => return None,
+            None if serial != NO_CONTEXT_SERIAL => return None,
+            _ => {}
+        }
+        Some(RequestIdentity {
+            slot: slot as u32,
+            generation: generation as u32,
+            operation,
+        })
+    }
+
+    /// Submission serials wrap. Uniqueness inside one generation comes from the one-outstanding-
+    /// operation invariant and from comparing the token with the posted lane exactly, so a wrapped
+    /// value can only alias a completion that stayed unretired for a further 2^20 submissions.
+    pub fn next_context_serial(current: u32) -> u32 {
+        if current >= MAXIMUM_CONTEXT_SERIAL {
+            1
+        } else {
+            current + 1
+        }
+    }
+
+    /// Generations wrap at the widest value the context can carry. A generation number is only
+    /// reused after its slot drained, so the reuse cannot alias a request that is still live.
+    pub fn next_context_generation(current: u32) -> u32 {
+        if current >= MAXIMUM_CONTEXT_GENERATION {
+            1
+        } else {
+            current + 1
+        }
+    }
+}
+
 pub mod arena {
     //! Registered arena: one VirtualAlloc region per worker (TCP) or one for the whole UDP
     //! engine, registered with RIO and sliced into fixed-stride slots.

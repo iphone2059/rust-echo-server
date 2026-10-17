@@ -1464,6 +1464,10 @@ pub mod udp {
 
         use crate::contract::checked_page_rounded_arena_bytes;
         use crate::native::arena::{Arena, udp_stride};
+        use crate::native::context::{
+            RECEIVE_TAG, SEND_TAG, decode_request_context, encode_request_context,
+            next_context_serial,
+        };
         use crate::native::rio::{
             CompletionPort, CompletionQueue, RequestQueue, empty_result,
             get_queued_completion_status,
@@ -1480,28 +1484,19 @@ pub mod udp {
         };
         use crate::udp::{Action, UdpEngine};
 
-        /// The RIO request context for one datagram slot. It is the record's first field, so the
-        /// address RIO hands back is the record address.
-        #[repr(C)]
-        pub struct UdpRequest {
-            pub slot_index: u32,
-        }
-
-        /// One slot's native state: the datagram buffer and the sender address RIOReceiveEx fills.
+        /// One slot's native state: the datagram buffer, the sender address RIOReceiveEx fills, and
+        /// the identity of the operation the provider currently owns for it.
         #[repr(C)]
         struct UdpSlotRuntime {
-            request: UdpRequest,
             payload: RIO_BUF,
             remote_address: RIO_BUF,
             provider_operation: Option<EngineOperation>,
             posted_length: u32,
             capacity: u32,
-        }
-
-        impl UdpSlotRuntime {
-            fn request_context(&self) -> *const c_void {
-                &self.request as *const UdpRequest as *const c_void
-            }
+            /// Value RIO hands back for the posted operation; zero while the slot owns none.
+            token: u64,
+            /// Submission serial of this slot; it is never reset, so a token is not reused.
+            serial: u32,
         }
 
         /// Identity marker whose address is this engine's completion key.
@@ -1578,15 +1573,14 @@ pub mod udp {
                 let slots = crate::types::try_boxed_slice_with(
                     depth as usize,
                     "UDP runtime allocation",
-                    |index| UdpSlotRuntime {
-                        request: UdpRequest {
-                            slot_index: index as u32,
-                        },
+                    |_index| UdpSlotRuntime {
                         payload: RIO_BUF::default(),
                         remote_address: RIO_BUF::default(),
                         provider_operation: None,
                         posted_length: 0,
                         capacity: options.rio_buffer_bytes,
+                        token: 0,
+                        serial: 0,
                     },
                 )
                 .map_err(allocation_error)?;
@@ -1662,24 +1656,6 @@ pub mod udp {
                 &*self.key as *const UdpKey as usize
             }
 
-            /// Maps a request context back to its slot, refusing anything this engine does not own.
-            fn slot_index(&self, address: usize) -> u32 {
-                let base = self.slots.as_ptr() as usize;
-                let stride = core::mem::size_of::<UdpSlotRuntime>();
-                let extent = stride * self.slots.len();
-                let end = base.saturating_add(extent);
-                if stride == 0 || address < base || address >= end || (address - base) % stride != 0
-                {
-                    fail_fast("server UDP RequestContext range", ERROR_INVALID_DATA);
-                }
-                let index = ((address - base) / stride) as u32;
-                let request = unsafe { &*(address as *const UdpRequest) };
-                if request.slot_index != index {
-                    fail_fast("server UDP RequestContext metadata", ERROR_INVALID_DATA);
-                }
-                index
-            }
-
             /// Arms the completion queue. Every registration is paired with one delivery.
             fn arm(&mut self, armed: &mut bool) {
                 if self.queue.is_armed() {
@@ -1735,18 +1711,32 @@ pub mod udp {
                     if length > slot.capacity {
                         fail_fast("UDP post exceeds registration", ERROR_INVALID_DATA);
                     }
-                    if slot.provider_operation.is_some() {
+                    if slot.provider_operation.is_some() || slot.token != 0 {
                         fail_fast("UDP slot reuse", ERROR_INVALID_DATA);
                     }
                     slot.payload.Length = length;
-                    let context = slot.request_context();
+                    let serial = next_context_serial(slot.serial);
+                    let tag = if operation == EngineOperation::Send {
+                        SEND_TAG
+                    } else {
+                        RECEIVE_TAG
+                    };
+                    // The UDP loop runs one generation per process, so the generation field is a
+                    // constant here and the submission serial alone separates two posts.
+                    let token = encode_request_context(index, 1, serial, tag);
+                    let context = token as usize as *const c_void;
                     let send = operation == EngineOperation::Send;
                     let queue = &self.request_queue;
-                    if send {
+                    let outcome = if send {
                         queue.send_ex(&rio, &mut slot.payload, &mut slot.remote_address, context)
                     } else {
                         queue.receive_ex(&rio, &mut slot.payload, &mut slot.remote_address, context)
+                    };
+                    if outcome.is_ok() {
+                        slot.serial = serial;
+                        slot.token = token;
                     }
+                    outcome
                 };
                 match outcome {
                     Ok(()) => {
@@ -1813,22 +1803,38 @@ pub mod udp {
                     }
                     for position in 0..count as usize {
                         let result = self.results[position];
-                        let index = self.slot_index(result.RequestContext as usize);
+                        let identity = decode_request_context(result.RequestContext)
+                            .unwrap_or_else(|| {
+                                fail_fast("server UDP RequestContext identity", ERROR_INVALID_DATA)
+                            });
+                        let Some(operation) = identity.operation else {
+                            fail_fast("server UDP RequestContext operation", ERROR_INVALID_DATA);
+                        };
+                        let index = identity.slot;
                         if self.engine.outstanding == 0
                             || !self.engine.slot(index).is_some_and(|slot| slot.outstanding)
                         {
                             fail_fast("UDP completion invariant", ERROR_INVALID_DATA);
                         }
-                        let slot = &mut self.slots[index as usize];
-                        let operation = slot.provider_operation.unwrap_or_else(|| {
+                        let slot = self.slots.get_mut(index as usize).unwrap_or_else(|| {
+                            fail_fast("server UDP RequestContext range", ERROR_INVALID_DATA)
+                        });
+                        if slot.token != result.RequestContext {
+                            fail_fast("UDP completion identity", ERROR_INVALID_DATA);
+                        }
+                        let live = slot.provider_operation.unwrap_or_else(|| {
                             fail_fast(
                                 "UDP completion without provider ownership",
                                 ERROR_INVALID_DATA,
                             )
                         });
+                        if live != operation {
+                            fail_fast("UDP completion operation", ERROR_INVALID_DATA);
+                        }
                         if result.BytesTransferred > slot.posted_length {
                             fail_fast("UDP completion exceeds posted range", ERROR_INVALID_DATA);
                         }
+                        slot.token = 0;
                         slot.provider_operation = None;
                         slot.posted_length = 0;
                         match self.engine.on_event_action(crate::types::Event::Completion(
@@ -2150,7 +2156,7 @@ pub mod worker {
     //! `runWorker` in the Swift port, including their failure classification.
 
     use core::ffi::c_void;
-    use core::mem::size_of;
+
     use core::ptr;
     use core::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -2162,6 +2168,10 @@ pub mod worker {
     use crate::contract::notification_packet_matches;
     use crate::engine::{Step, TcpEngine};
     use crate::native::arena::Arena;
+    use crate::native::context::{
+        RECEIVE_TAG, REQUEST_QUEUE_TAG, SEND_TAG, decode_request_context, encode_request_context,
+        next_context_generation, next_context_serial,
+    };
     use crate::native::rio::{
         CompletionPort, CompletionQueue, RequestQueue, empty_result, get_queued_completion_status,
         post_completion,
@@ -2175,17 +2185,13 @@ pub mod worker {
         EngineOperation, NotifySnapshot, STOP_KEY, Statistics, WAIT_TIMEOUT, WorkerPhase,
     };
 
-    /// The RIO request context. It is the first field of a connection record, so the address
-    /// RIO hands back in RIORESULT is the record address and the slot index follows from the
-    /// table layout alone.
+    /// Identity the provider currently owns for one connection slot. `token` is zero while no
+    /// operation is posted; `serial` is the slot's submission serial and is never reset across
+    /// generations, so a token value is not reused by a later submission of the same slot.
     #[repr(C)]
     pub struct Request {
-        pub connection_index: u32,
-        pub operation: EngineOperation,
-        /// The generation that posted this context. The context address is stable for the slot's
-        /// lifetime, so the tag travels with it and a completion can be told apart from one of an
-        /// earlier generation even when the slot has since been adopted again.
-        pub generation: u32,
+        pub token: u64,
+        pub serial: u32,
     }
 
     /// One connection slot's native state. The socket and the request queue exist only while
@@ -2204,14 +2210,10 @@ pub mod worker {
     }
 
     impl ConnectionRuntime {
-        fn request_context(&self) -> *const c_void {
-            &self.request as *const Request as *const c_void
-        }
-
         /// Closes the socket and forgets the request queue. The engine has already returned
         /// the index to its free list, so nothing may post through this record any more.
         fn release(&mut self) {
-            if self.provider_operation.is_some() {
+            if self.provider_operation.is_some() || self.request.token != 0 {
                 fail_fast("connection release with outstanding operation", 996);
             }
             self.request_queue = None;
@@ -2353,11 +2355,10 @@ pub mod worker {
             let connections = crate::types::try_boxed_slice_with(
                 slot_count as usize,
                 "worker allocation",
-                |slot| ConnectionRuntime {
+                |_slot| ConnectionRuntime {
                     request: Request {
-                        connection_index: slot as u32,
-                        operation: EngineOperation::Receive,
-                        generation: 0,
+                        token: 0,
+                        serial: 0,
                     },
                     generation: 0,
                     socket: SocketOwner::new(INVALID_SOCKET),
@@ -2709,23 +2710,44 @@ pub mod worker {
                 }
                 for position in 0..count as usize {
                     let result = self.results[position];
-                    let index = self.request_index(result.RequestContext as usize);
-                    let runtime = &mut self.connections[index as usize];
-                    let operation = runtime.provider_operation.unwrap_or_else(|| {
+                    let identity =
+                        decode_request_context(result.RequestContext).unwrap_or_else(|| {
+                            fail_fast("server RIO RequestContext identity", ERROR_INVALID_DATA)
+                        });
+                    let Some(operation) = identity.operation else {
+                        fail_fast("server RIO RequestContext operation", ERROR_INVALID_DATA);
+                    };
+                    let index = identity.slot;
+                    let runtime = self.connections.get_mut(index as usize).unwrap_or_else(|| {
+                        fail_fast("server RIO RequestContext range", ERROR_INVALID_DATA)
+                    });
+                    // The queue identity is bound to the generation that created it, so a completion
+                    // whose queue belongs to an earlier generation is rejected here, before the
+                    // slot's own posted token is even compared.
+                    let queue_identity =
+                        encode_request_context(index, runtime.generation, 0, REQUEST_QUEUE_TAG);
+                    if result.SocketContext != queue_identity {
+                        fail_fast("worker RIO SocketContext identity", ERROR_INVALID_DATA);
+                    }
+                    if runtime.request.token != result.RequestContext {
+                        fail_fast("worker completion identity", ERROR_INVALID_DATA);
+                    }
+                    let live = runtime.provider_operation.unwrap_or_else(|| {
                         fail_fast(
                             "worker completion without provider ownership",
                             ERROR_INVALID_DATA,
                         )
                     });
-                    if operation != runtime.request.operation {
+                    if live != operation {
                         fail_fast("worker completion operation", ERROR_INVALID_DATA);
                     }
-                    if runtime.request.generation != runtime.generation {
+                    if identity.generation != runtime.generation {
                         fail_fast("worker completion generation", ERROR_INVALID_DATA);
                     }
                     if result.BytesTransferred > runtime.posted_length {
                         fail_fast("worker completion exceeds posted range", ERROR_INVALID_DATA);
                     }
+                    runtime.request.token = 0;
                     runtime.provider_operation = None;
                     runtime.posted_length = 0;
                     let step = self.engine.on_event(
@@ -2743,25 +2765,6 @@ pub mod worker {
                     return;
                 }
             }
-        }
-
-        /// Maps a RIO request context back to its slot. The context is the address of the
-        /// record's first field, so the address has to fall inside this table, be aligned and
-        /// carry the slot's own index; anything else is a completion this worker does not own.
-        fn request_index(&self, address: usize) -> u32 {
-            let base = self.connections.as_ptr() as usize;
-            let stride = size_of::<ConnectionRuntime>();
-            let extent = stride * self.connections.len();
-            let end = base.saturating_add(extent);
-            if stride == 0 || address < base || address >= end || (address - base) % stride != 0 {
-                fail_fast("server RIO RequestContext range", ERROR_INVALID_DATA);
-            }
-            let index = ((address - base) / stride) as u32;
-            let request = unsafe { &*(address as *const Request) };
-            if request.connection_index != index {
-                fail_fast("server RIO request metadata", ERROR_INVALID_DATA);
-            }
-            index
         }
 
         fn execute_all(&mut self, steps: &[Step]) {
@@ -2803,17 +2806,23 @@ pub mod worker {
                     .connections
                     .get_mut(index as usize)
                     .unwrap_or_else(|| fail_fast("worker post index", ERROR_INVALID_DATA));
-                if runtime.provider_operation.is_some() {
+                if runtime.provider_operation.is_some() || runtime.request.token != 0 {
                     fail_fast("RIOReceive slot reuse", ERROR_INVALID_DATA);
                 }
-                runtime.request.operation = EngineOperation::Receive;
+                let serial = next_context_serial(runtime.request.serial);
+                let token = encode_request_context(index, runtime.generation, serial, RECEIVE_TAG);
                 runtime.buffer.Offset = 0;
                 runtime.buffer.Length = stride;
-                let context = runtime.request_context();
-                match runtime.request_queue.as_ref() {
+                let context = token as usize as *const c_void;
+                let outcome = match runtime.request_queue.as_ref() {
                     Some(queue) => queue.receive(&rio, &mut runtime.buffer, context),
                     None => fail_fast("RIOReceive(missing request queue)", ERROR_INVALID_DATA),
+                };
+                if outcome.is_ok() {
+                    runtime.request.serial = serial;
+                    runtime.request.token = token;
                 }
+                outcome
             };
             if let Err(error) = outcome {
                 report(error.stage, error.code);
@@ -2850,17 +2859,23 @@ pub mod worker {
                     .connections
                     .get_mut(index as usize)
                     .unwrap_or_else(|| fail_fast("worker post index", ERROR_INVALID_DATA));
-                if runtime.provider_operation.is_some() {
+                if runtime.provider_operation.is_some() || runtime.request.token != 0 {
                     fail_fast("RIOSend slot reuse", ERROR_INVALID_DATA);
                 }
-                runtime.request.operation = EngineOperation::Send;
+                let serial = next_context_serial(runtime.request.serial);
+                let token = encode_request_context(index, runtime.generation, serial, SEND_TAG);
                 runtime.buffer.Offset = offset;
                 runtime.buffer.Length = length;
-                let context = runtime.request_context();
-                match runtime.request_queue.as_ref() {
+                let context = token as usize as *const c_void;
+                let outcome = match runtime.request_queue.as_ref() {
                     Some(queue) => queue.send(&rio, &mut runtime.buffer, context),
                     None => fail_fast("RIOSend(missing request queue)", ERROR_INVALID_DATA),
+                };
+                if outcome.is_ok() {
+                    runtime.request.serial = serial;
+                    runtime.request.token = token;
                 }
+                outcome
             };
             if let Err(error) = outcome {
                 report(error.stage, error.code);
@@ -2928,8 +2943,18 @@ pub mod worker {
                 }
                 return;
             };
+            if self.connections[slot as usize].request.token != 0
+                || self.connections[slot as usize].provider_operation.is_some()
+            {
+                fail_fast("TCP slot reuse precondition", 996);
+            }
+            // The generation is chosen before the queue exists so that the queue identity and the
+            // first post of the new generation both name the generation this slot is about to
+            // admit. It is committed only when the queue was created.
+            let generation = next_context_generation(self.connections[slot as usize].generation);
             let prepared = {
-                let context = self.connections[slot as usize].request_context() as *mut c_void;
+                let context = encode_request_context(slot, generation, 0, REQUEST_QUEUE_TAG)
+                    as usize as *mut c_void;
                 let queue = RequestQueue::create(
                     &self.rio,
                     socket.raw(),
@@ -2952,16 +2977,11 @@ pub mod worker {
                     let runtime = &mut self.connections[slot as usize];
                     runtime.buffer = buffer;
                     runtime.request_queue = Some(queue);
-                    runtime.request.operation = EngineOperation::Receive;
-                    // This is the slot's only reuse point, so it is where the generation changes. The
-                    // request context is retagged before any operation of the new generation can be
-                    // posted. The tag is an identity rather than an ownership ledger.
-                    runtime.generation = if runtime.generation == u32::MAX {
-                        1
-                    } else {
-                        runtime.generation + 1
-                    };
-                    runtime.request.generation = runtime.generation;
+                    // This is the slot's only reuse point, so it is where the generation changes. Every
+                    // submission carries the generation it was posted under, so a completion of the
+                    // previous generation can still be told apart after this record was rewritten. The
+                    // tag is an identity rather than an ownership ledger and never uses zero.
+                    runtime.generation = generation;
                     core::mem::swap(&mut runtime.socket, &mut socket);
                 }
                 Err(error) => {
